@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ヘキサうどん リアルタイム監視</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0b0e11; --panel:#151a20; --ink:#e9eef4; --sub:#8e9aa7;
+    --line:#2a323b; --accent:#4c8ef7; --good:#2eb872; --bad:#ef4f4f; --warn:#e8992e;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; }
+  body{ margin:0; background:var(--bg); color:var(--ink); font-size:13px; line-height:1.45;
+        font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif; overflow:hidden; }
+  header{ height:36px; padding:0 12px; background:var(--panel);
+          border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px; }
+  h1{ font-size:13px; margin:0; font-weight:700; white-space:nowrap; }
+  .pill{ padding:1px 9px; border:1px solid var(--line); border-radius:999px;
+         font-size:11.5px; color:var(--sub); white-space:nowrap; }
+  .pill.live{ border-color:var(--good); color:var(--good); }
+  .pill.stale{ border-color:var(--bad); color:var(--bad); }
+  .pill.big{ font-weight:700; color:var(--ink); }
+  main{ height:calc(100% - 36px); display:grid; gap:8px; padding:8px;
+        grid-template-columns:1fr 420px; overflow:hidden; }
+  main.wide{ grid-template-columns:1fr 0; }
+  main.wide > .side{ display:none; }
+  @media (max-width:1240px){ main{ grid-template-columns:1fr 340px; } }
+  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:6px 8px; min-height:0; display:flex; flex-direction:column; }
+  .panel.board{ padding:4px; }
+  .panel > h2{ font-size:10.5px; margin:0 0 5px; color:var(--sub); font-weight:700;
+               letter-spacing:.06em; flex:none; }
+  .scroll{ overflow:auto; min-height:0; }
+  #stageWrap{ flex:1; min-height:0; display:flex; align-items:center; justify-content:center; }
+  #stage{ display:block; }
+  .ctl{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:6px; flex:none; }
+  button{ font:inherit; font-size:11.5px; padding:3px 9px; border:1px solid var(--line);
+          border-radius:5px; background:#1c232b; color:var(--ink); cursor:pointer; }
+  button:hover{ border-color:var(--accent); color:var(--accent); }
+  button.on{ background:var(--accent); color:#0b0e11; border-color:var(--accent); font-weight:700; }
+  input[type=range]{ flex:1; min-width:90px; accent-color:var(--accent); }
+  table{ border-collapse:collapse; width:100%; font-size:11.5px; }
+  th,td{ border-bottom:1px solid var(--line); padding:2px 4px; text-align:right;
+         font-variant-numeric:tabular-nums; white-space:nowrap; }
+  td.l{ max-width:130px; overflow:hidden; text-overflow:ellipsis; }
+  th{ color:var(--sub); font-weight:600; font-size:10.5px; position:sticky; top:0;
+      background:var(--panel); z-index:1; }
+  td.l,th.l{ text-align:left; }
+  tr.pick{ background:#4c8ef733; }
+  tbody tr{ cursor:pointer; }
+  tbody tr:hover{ background:#4c8ef71f; }
+  .kv{ display:grid; grid-template-columns:auto 1fr auto 1fr; gap:0 8px;
+       font-size:11px; line-height:1.35; }
+  .kv dd{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .kv dt{ color:var(--sub); white-space:nowrap; }
+  .kv dd{ margin:0; font-variant-numeric:tabular-nums; }
+  .sub{ color:var(--sub); font-size:11px; }
+  .bar{ height:5px; border-radius:3px; background:#2a323b; overflow:hidden; min-width:40px; }
+  .bar span{ display:block; height:100%; }
+  pre{ margin:0; font-size:10.5px; line-height:1.4; background:#0e1318;
+       border:1px solid var(--line); border-radius:5px; padding:6px; overflow:auto; }
+  .tabs{ display:flex; gap:4px; margin-bottom:5px; flex:none; }
+  .side{ display:flex; flex-direction:column; gap:8px; min-height:0; overflow:hidden; }
+  /* 1=設定（内容ぶん）／ 2=エージェント（内容ぶん）／
+     3=探索（固定）／ 4=日ごと・提出（残り全部） */
+  .side .panel:nth-child(1){ flex:0 0 auto; }
+  .side .panel:nth-child(2){ flex:0 0 auto; max-height:200px; }
+  .side .panel:nth-child(3){ flex:0 0 118px; }
+  .side .panel:nth-child(4){ flex:1 1 auto; min-height:180px; }
+  .try{ font-size:11px; padding:1px 0; display:flex; gap:6px; align-items:center; }
+  .try .name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* パネルの中身が枠からはみ出さないようにする */
+  .panel, .panel *{ min-width:0; }
+  #searchNow{ overflow:hidden; }
+  #searchNow > div{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .swatch{ display:inline-block; width:9px; height:9px; border-radius:2px;
+           border:1px solid #0008; vertical-align:-1px; margin-right:3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ヘキサうどん 監視</h1>
+  <span id="live" class="pill">接続中…</span>
+  <span id="phase" class="pill"></span>
+  <span id="score" class="pill big"></span>
+  <span id="mismatch" class="pill"></span>
+  <span id="searchPill" class="pill"></span>
+</header>
+
+<main>
+  <section class="panel board">
+    <h2 style="margin:0 0 3px 4px">盤面</h2>
+    <div id="stageWrap"><canvas id="stage"></canvas></div>
+    <div class="ctl">
+      <button id="play">▶ 再生</button>
+      <button id="back">◀</button><button id="fwd">▶</button>
+      <input id="seek" type="range" min="0" max="0" value="0" step="0.01">
+      <span class="sub" id="stepLabel">0 / 0</span>
+      <span class="sub">速さ</span>
+      <button class="spd" data-v="1">1x</button><button class="spd" data-v="2">2x</button>
+      <button class="spd" data-v="4">4x</button><button class="spd" data-v="8">8x</button>
+      <button class="spd" data-v="16">16x</button>
+      <button id="follow">最新を追う</button>
+      <button id="trail" class="on">軌跡</button>
+      <button id="wide">盤面を広く</button>
+    </div>
+    <div class="sub" id="legend" style="margin-top:4px"></div>
+  </section>
+
+  <div class="side">
+    <section class="panel">
+      <h2>試合の設定</h2>
+      <dl class="kv" id="setup"></dl>
+    </section>
+    <section class="panel">
+      <h2>エージェント</h2>
+      <div class="scroll"><table id="agentTable"></table></div>
+      <div class="sub" id="brandLine" style="margin-top:4px"></div>
+    </section>
+    <section class="panel">
+      <h2>いま探索していること</h2>
+      <div id="searchNow" class="sub"></div>
+      <div class="scroll" id="searchList" style="margin-top:4px"></div>
+    </section>
+    <section class="panel">
+      <h2>日ごとの結果 ／ 提出内容</h2>
+      <div class="tabs">
+        <button class="tab on" data-t="days">日ごと</button>
+        <button class="tab" data-t="events">できごと</button>
+        <button class="tab" data-t="brands">系列</button>
+        <button class="tab" data-t="actions">行動</button>
+      </div>
+      <div class="scroll" id="tabBody"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+/* 監視は読むだけ。試合の処理には一切さわりません。 */
+// 地形の色。対照的になるよう、色相を離してあります。
+const TERRAIN = ["#6b4a2f", "#8a8f96", "#1f4d34", "#10243f"];  // 平地=茶 道路=灰 山地=深緑 池=暗い青
+const TNAME = ["平地","道路","山地","池"];
+// 混雑・渋滞はマスのふちの色で表します（塗りつぶしはしません）。
+const ROADEDGE = [null, "#e8992e", "#ef4f4f"];
+const AGENTC = ["#4c8ef7","#2eb872","#c77dff","#ff9f43","#3ddad7","#ff6b81","#b5e48c"];
+
+let live=null, pickedDay=-1, pos=0, playing=false, speed=1, follow=true, tab="days";
+let last=0, showTrail=true;
+const $=id=>document.getElementById(id);
+
+/* 系列の色。色相を均等に割り、明度と彩度を交互に変えて隣を見分けやすくします。 */
+function brandColor(brand, count, dim){
+  const n = Math.max(1, count);
+  const hue = (brand * 360 / n + (brand % 2) * 18) % 360;
+  const sat = brand % 3 === 0 ? 78 : brand % 3 === 1 ? 64 : 88;
+  const lit = dim ? 26 : (brand % 2 ? 62 : 54);
+  return `hsl(${hue.toFixed(0)} ${sat}% ${lit}%)`;
+}
+
+async function poll(){
+  try{
+    const r=await fetch("live/state.json?t="+Date.now(),{cache:"no-store"});
+    if(r.ok){
+      const next=await r.json();
+      const grew=live&&next.days.length>live.days.length;
+      const searching=(next.status||{}).phase==="探索中";
+      live=next;
+      if(follow&&(grew||pickedDay<0||searching)){
+        pickedDay=live.days.length-1;
+        // 探索中は暫定案が入れ替わるので、再生位置は保ったまま日だけ合わせる
+        if(grew||pickedDay<0) pos=0;
+      }
+      draw();
+    }
+  }catch(e){}
+  setTimeout(poll,600);
+}
+function day(){ return (live&&live.days.length)
+  ? live.days[Math.min(Math.max(pickedDay,0),live.days.length-1)] : null; }
+
+/* 位置は Python が送る tracks（1歩ごとの実際のマス）をそのまま使います。
+   行動値から方向を解釈し直すと間違えるので、そこはもうやりません。
+   移動にNステップかかるとき、位置が変わるのは最後の1歩です。 */
+function timeline(d,h){
+  if(!d || !d.tracks || !d.tracks.length) return null;
+  const total=d.daySteps||0, paths=[], routes=[];
+  if(!total) return null;
+  for(let a=0;a<h.agentKinds.length;a++){
+    const tr=d.tracks[a]||[];
+    const seg=[], route=[];
+    for(let s=0;s<total;s++){
+      const f=tr[s]!==undefined?tr[s]:(tr[tr.length-1]||d.startPositions[a]);
+      const t=tr[s+1]!==undefined?tr[s+1]:f;
+      seg.push({f,t,move:f!==t});
+    }
+    // 通ったマスの並び（同じマスの連続はまとめる）
+    for(const v of tr) if(route.length===0||route[route.length-1]!==v) route.push(v);
+    paths.push(seg); routes.push(route);
+  }
+  return {paths,total,routes};
+}
+
+function draw(){
+  if(!live) return;
+  const h=live.header, st=live.status||{};
+  const age=Math.round(Date.now()/1000-(live.updatedAt||0));
+  $("live").textContent=age<90?`更新 ${age}秒前`:`停止？ ${age}秒前`;
+  $("live").className="pill "+(age<90?"live":"stale");
+  $("phase").textContent=`${st.phase||""}${st.day?" ／ "+st.day+"日目":""}`;
+  if(!h||!h.cells){ $("phase").textContent="試合の開始を待っています"; return; }
+  // 日のデータがまだ無くても、マップと種別は届いた時点で描きます。
+  if(!live.days.length){
+    board(h,null,null); setup(h,null); search(st);
+    $("agentTable").innerHTML=kindsOnly(h);
+    $("tabBody").innerHTML=""; $("brandLine").textContent="";
+    $("stepLabel").textContent="試合開始を待っています";
+    return;
+  }
+  const d=day();
+  $("score").textContent=d?`種類 ${d.brandTotal} ／ 日別 ${d.dailyTotal} ／ 玉 ${d.noodleTotal}`:"";
+  const bad=(st.mismatches||[]).length;
+  $("mismatch").textContent=bad?`ズレ ${bad}件`:(st.score?"ズレなし":"");
+  $("mismatch").className="pill "+(bad?"stale":"live");
+  const line=timeline(d,h);
+  if(line){
+    $("seek").max=line.total;
+    if(pos>line.total) pos=line.total;
+    $("seek").value=pos;
+    $("stepLabel").textContent=`${pos.toFixed(1)} / ${line.total}`;
+  }
+  board(h,d,line); setup(h,d); agents(h,d,line); tabBody(h,d); search(st);
+  if(d && !line) $("stepLabel").textContent="（軌跡データがありません）";
+}
+
+// まだ試合が始まっていなくても、決めた種別だけは見せる。
+function kindsOnly(h){
+  return `<thead><tr><th class="l">#</th><th class="l">種別</th>
+    <th>開始位置</th></tr></thead><tbody>`
+    + h.agentKinds.map((k,a)=>
+      `<tr><td class="l"><span style="color:${AGENTC[a%AGENTC.length]}">●</span>${a}</td>
+       <td class="l">${k===1?"補給車":"巡回車"}</td><td>—</td></tr>`).join("")
+    + "</tbody>";
+}
+
+function search(st){
+  const pill=$("searchPill");
+  if(st.phase==="探索中"){
+    pill.textContent=`探索中 残り${st.secondsLeft}秒 / ${st.candidates}件`;
+    pill.className="pill live";
+    $("searchNow").innerHTML=
+      `<div>試行中 <strong style="color:var(--ink)">${st.trying||"—"}</strong></div>`
+      +`<div>最良 <strong style="color:var(--good)">${st.bestLabel||"—"}</strong>`
+      +(st.bestScore?` <span class="sub">${st.bestScore.join("/")}</span>`:"")
+      +` <span class="sub">／ ${st.candidates}件 ／ 出直${st.resubmissions||0}</span></div>`;
+    $("searchList").innerHTML=(st.recent||[]).map(r=>
+      `<div class="try"><span style="width:12px;flex:none;color:var(--good)">${r.best?"★":""}</span>
+       <span class="name">${r.label}</span>
+       <span class="sub" style="flex:none">${r.brands}/${r.daily}/${r.noodles}</span></div>`).join("")
+      || `<div class="sub">まだありません</div>`;
+  }else{
+    pill.textContent=""; pill.className="pill";
+    $("searchNow").innerHTML=`<span class="sub">いまは探索していません（提出済み）</span>`;
+    $("searchList").innerHTML="";
+  }
+}
+
+function board(h,d,line){
+  const c=$("stage"), ctx=c.getContext("2d"), wrap=$("stageWrap");
+  const W=wrap.clientWidth, H=wrap.clientHeight;
+  const r=Math.max(5, Math.min(W/((h.width+0.5)*1.732), H/(h.height*1.5+0.5)));
+  const cw=Math.ceil((h.width+0.5)*r*1.732)+2, ch=Math.ceil(h.height*r*1.5+r*0.5)+2;
+  const dpr=Math.min(3,devicePixelRatio||1);
+  if(c.width!==cw*dpr||c.height!==ch*dpr){
+    c.width=cw*dpr; c.height=ch*dpr; c.style.width=cw+"px"; c.style.height=ch+"px";
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cw,ch);
+  // 一番上を1行目とすると、奇数行目が右・偶数行目が左へずれます。
+  // プログラム上の row=0 が1行目なので、**偶数インデックスの行が右**です。
+  // ここを逆にしていたため、軌跡とエージェントの位置がずれていました。
+  const X=p=>((p%h.width)+(1-((((p/h.width)|0)%2)))*0.5+0.5)*r*1.732+1;
+  const Y=p=>(((p/h.width)|0)+0.5)*r*1.5+1;
+  const roads=(d&&d.roads)?d.roads:{};
+
+  // マス。境目は黒い線。混雑と渋滞は**ふちの色**で表します。
+  for(let i=0;i<h.cells.length;i++){
+    hex(ctx,X(i),Y(i),r);
+    ctx.fillStyle=TERRAIN[h.cells[i]]||"#555"; ctx.fill();
+    ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(0.8, r*0.075); ctx.stroke();
+  }
+  // ふちは塗りのあとに描く（隣のマスに上書きされないように）
+  for(let i=0;i<h.cells.length;i++){
+    const st=roads[String(i)];
+    if(!st) continue;
+    hex(ctx,X(i),Y(i),r*0.93);
+    ctx.strokeStyle = st===2 ? "#ef4f4f" : "#e8992e";
+    ctx.lineWidth = Math.max(1.6, r*0.22);
+    ctx.stroke();
+  }
+
+  // 軌跡（点線）。通った分は濃く、これからの分は薄く。
+  if(d&&line&&showTrail){
+    ctx.setLineDash([Math.max(2,r*0.34), Math.max(2,r*0.3)]);
+    ctx.lineWidth=Math.max(1.4, r*0.13); ctx.lineCap="round";
+    for(let a=0;a<h.agentKinds.length;a++){
+      const route=line.routes[a];
+      if(route.length<2) continue;
+      const seen=passedCount(d.tracks[a]||[], pos);
+      for(let k=0;k<route.length-1;k++){
+        ctx.beginPath();
+        ctx.moveTo(X(route[k]),Y(route[k]));
+        ctx.lineTo(X(route[k+1]),Y(route[k+1]));
+        ctx.strokeStyle=AGENTC[a%AGENTC.length] + (k<seen ? "cc" : "38");
+        ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
+  }
+
+  // 店。系列を色で表し、数字は円の中央に置きます。
+  const taken=new Map(), gotBrands=new Set();
+  if(d&&d.acquired) for(const e of d.acquired) if(e.step<=pos){
+    taken.set(e.pos,(taken.get(e.pos)||0)+1); gotBrands.add(e.brand);
+  }
+  ctx.textAlign="center"; ctx.textBaseline="middle";
+  for(const sp of h.spots){
+    const x=X(sp.pos), y=Y(sp.pos);
+    const left=Math.max(0,sp.stocks-(taken.get(sp.pos)||0));
+    const col=brandColor(sp.brand, h.brandCount, gotBrands.has(sp.brand));
+    // 店はマス目と同じ六角形。マスに重ならないよう、ひと回り小さく描きます。
+    hex(ctx,x,y,r*0.66);
+    ctx.fillStyle=col; ctx.fill();
+    ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(1, r*0.11); ctx.stroke();
+    // 在庫は店の下の点。残り=明るい赤、取った分=暗い赤。
+    const dot=Math.max(1.2,r*0.095), gap=dot*2.6, w=(sp.stocks-1)*gap;
+    for(let k=0;k<sp.stocks;k++){
+      ctx.beginPath(); ctx.arc(x-w/2+k*gap, y+r*0.44, dot, 0, 7);
+      ctx.fillStyle=k<left?"#ff5d5d":"#5a2020"; ctx.fill();
+    }
+  }
+
+  if(d&&line){
+    for(let a=0;a<h.agentKinds.length;a++){
+      const i=Math.min(Math.floor(pos),line.total-1);
+      const seg=line.paths[a][Math.max(0,i)];
+      if(!seg) continue;
+      const frac=pos-Math.floor(pos);
+      const t=seg.move?frac:0;
+      const x=X(seg.f)+(X(seg.t)-X(seg.f))*t, y=Y(seg.f)+(Y(seg.t)-Y(seg.f))*t;
+      const col=AGENTC[a%AGENTC.length], sup=h.agentKinds[a]===1;
+      ctx.beginPath();
+      if(sup) ctx.rect(x-r*0.44,y-r*0.44,r*0.88,r*0.88); else ctx.arc(x,y,r*0.5,0,7);
+      ctx.fillStyle=col; ctx.fill();
+      ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(1, r*0.1); ctx.stroke();
+      // 数字は白で固定。色が濃くても薄くても読めるよう、黒い縁取りを付ける。
+      ctx.font=`800 ${Math.max(9,r*0.62)}px system-ui`;
+      ctx.lineWidth=Math.max(1.6, r*0.16); ctx.strokeStyle="#000";
+      ctx.strokeText(a,x,y);
+      ctx.fillStyle="#fff"; ctx.fillText(a,x,y);
+      if(!sup){
+        const f=fuel(d,a,pos,h.fuelLimit), bw=r*1.3, bx=x-bw/2, by=y+r*0.66, bh=Math.max(2.5,r*0.13);
+        ctx.fillStyle="#000b"; ctx.fillRect(bx-1,by-1,bw+2,bh+2);
+        ctx.fillStyle=f.ratio>.5?"#2eb872":f.ratio>.2?"#e8992e":"#ef4f4f";
+        ctx.fillRect(bx,by,bw*f.ratio,bh);
+      }
+    }
+  }
+  $("legend").innerHTML = TNAME.map((n,i)=>
+    `<span class="swatch" style="background:${TERRAIN[i]}"></span>${n}`).join("　")
+    + '　／　<span class="swatch" style="background:transparent;border:2px solid #e8992e"></span>混雑'
+    + '<span class="swatch" style="background:transparent;border:2px solid #ef4f4f"></span>渋滞'
+    + "　／　●巡回 ■補給　／　六角形=店（色が系列・取得済みは暗く）　／　赤い点=残り在庫　／　点線=通り道";
+}
+
+// いま何マス目まで進んだか（軌跡の濃淡に使う）
+function passedCount(track, at){
+  let moved=0;
+  const upto=Math.min(Math.floor(at), track.length-1);
+  for(let s=1;s<=upto;s++) if(track[s]!==track[s-1]) moved++;
+  return moved;
+}
+
+function fuel(d,a,at,limit){
+  let v=(d.startFuels||[])[a];
+  if(v===undefined) v=d.fuels[a];
+  for(const e of (d.refuelEvents||[])) if(e.agent===a&&e.step<=at) v=e.after;
+  if(at>=d.daySteps) v=d.fuels[a];
+  return {v,ratio:Math.max(0,Math.min(1,v/limit))};
+}
+function hex(ctx,x,y,r){
+  ctx.beginPath();
+  for(let i=0;i<6;i++){
+    const a=Math.PI/180*(60*i-90);
+    const px=x+r*Math.cos(a), py=y+r*Math.sin(a);
+    i?ctx.lineTo(px,py):ctx.moveTo(px,py);
+  }
+  ctx.closePath();
+}
+
+function setup(h,d){
+  const sup=h.agentKinds.filter(k=>k===1).length, tour=h.agentKinds.length-sup;
+  // その日に取りうる上限（1店から1台が1日1玉まで）
+  const cap=h.spots.reduce((s,x)=>s+Math.min(x.stocks,tour),0);
+  const rows=[
+    ["マップ",`${h.height}×${h.width}`],["体数",`巡回${tour} / 補給${sup}`],
+    ["日数",h.dayCount],["players",h.players],
+    ["系列",h.brandCount],["店",h.spots.length],
+    ["燃料上限",h.fuelLimit],["混雑/渋滞",`${h.busyThreshold} / ${h.jammedThreshold}`],
+    ["歩数",h.daySteps.join(" ")],["1日の上限",`${cap}玉`],
+  ];
+  if(d){
+    const rate=cap?Math.round(d.acquired.length/cap*100):0;
+    const road=Object.values(d.roads||{});
+    rows.push(["採用",d.label],["候補",`${d.candidates}件`],
+      ["この日",`${d.acquired.length} / ${cap}玉（${rate}%）`],
+      ["出し直し",`${d.resubmissions}回 rev${d.revision}`],
+      ["混雑セル",road.filter(v=>v===1).length],["渋滞セル",road.filter(v=>v===2).length]);
+  }
+  $("setup").innerHTML=rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+function dayTableHtml(){
+  const h=live.header;
+  const tour=h.agentKinds.filter(k=>k===0).length;
+  const cap=h.spots.reduce((s,x)=>s+Math.min(x.stocks,tour),0);
+  return `<thead><tr><th>日</th><th class="l">採用した案</th><th>歩</th>
+    <th>獲得</th><th>率</th><th>1玉</th><th>日別</th><th>玉計</th>
+    <th>候補</th><th>補給</th></tr></thead><tbody>`
+    +live.days.map((d,i)=>{
+      const got=d.acquired.length;
+      const rate=cap?Math.round(got/cap*100):0;
+      const per=got?(d.daySteps*tour/got).toFixed(1):"—";
+      return `<tr class="${i===pickedDay?"pick":""}" onclick="pick(${i})">
+      <td>${d.day}</td><td class="l">${d.label}</td><td>${d.daySteps}</td>
+      <td>${got}</td><td style="color:${rate>=70?"var(--good)":rate>=50?"var(--warn)":"var(--bad)"}">${rate}%</td>
+      <td>${per}</td><td>${d.dailyTotal}</td><td>${d.noodleTotal}</td>
+      <td>${d.candidates}</td><td>${(d.refuelEvents||[]).length}</td></tr>`;
+    }).join("")+"</tbody>";
+}
+function pick(i){ pickedDay=i; pos=0; follow=false; $("follow").classList.remove("on"); draw(); }
+
+function agents(h,d,line){
+  if(!d){ $("agentTable").innerHTML=""; return; }
+  $("agentTable").innerHTML=`<thead><tr><th class="l">#</th><th class="l">種別</th>
+    <th>いま</th><th>終了</th><th>燃料</th><th></th><th>獲得</th><th>移動</th>
+    <th>待機</th><th>補給</th></tr></thead><tbody>`
+    +h.agentKinds.map((k,a)=>{
+      const got=d.acquired.filter(e=>e.agent===a&&e.step<=pos).length;
+      const all=d.acquired.filter(e=>e.agent===a).length;
+      const seg=line?line.paths[a][Math.min(Math.floor(pos),line.total-1)]:null;
+      const p=seg?(seg.move?seg.f:seg.t):d.positions[a], f=fuel(d,a,pos,h.fuelLimit);
+      const mv=(d.actions[a]||[]).filter(x=>x>=0).length;
+      const wt=(d.actions[a]||[]).filter(x=>x<0).reduce((s,x)=>s-x,0);
+      const bar=k===1?"—":`<div class="bar"><span style="width:${(f.ratio*100)|0}%;background:${
+        f.ratio>.5?"#2eb872":f.ratio>.2?"#e8992e":"#ef4f4f"}"></span></div>`;
+      const rf=(d.refuelEvents||[]).filter(e=>e.agent===a).length;
+      return `<tr><td class="l"><span style="color:${AGENTC[a%AGENTC.length]}">●</span>${a}</td>
+        <td class="l">${k===1?"補給":"巡回"}</td><td>${p}</td><td>${d.positions[a]}</td>
+        <td>${k===1?"—":f.v}</td><td>${bar}</td><td>${got}/${all}</td>
+        <td>${mv}</td><td>${wt}</td><td>${rf}</td></tr>`;
+    }).join("")+"</tbody>";
+  const bs=[...new Set(d.acquired.filter(e=>e.step<=pos).map(e=>e.brand))].sort((a,b)=>a-b);
+  $("brandLine").innerHTML=`そろえた系列 ${bs.length}/${h.brandCount}: `
+    + bs.map(b=>`<span class="swatch" style="background:${brandColor(b,h.brandCount,false)}"></span>${b}`).join(" ");
+}
+
+function tabBody(h,d){
+  if(tab==="days"){ $("tabBody").innerHTML=`<table>`+dayTableHtml()+`</table>`; return; }
+  if(!d){ $("tabBody").innerHTML=""; return; }
+  if(tab==="events"){
+    const ev=[];
+    for(const e of d.acquired) ev.push([e.step,`車${e.agent} 位置${e.pos} 系列${e.brand}`,e.brand]);
+    for(const e of (d.refuelEvents||[])) ev.push([e.step,`車${e.agent} 補給 ${e.before}→${e.after}`,null]);
+    ev.sort((a,b)=>a[0]-b[0]);
+    $("tabBody").innerHTML=`<table><thead><tr><th>歩</th>
+      <th class="l">できごと ${ev.length}件</th></tr></thead><tbody>`
+      +ev.map(([s,t,b])=>`<tr style="${s<=pos?"":"opacity:.45"}"><td>${s}</td><td class="l">`
+        +(b!==null?`<span class="swatch" style="background:${brandColor(b,h.brandCount,false)}"></span>`:"")
+        +`${t}</td></tr>`).join("")+"</tbody></table>";
+  }else if(tab==="brands"){
+    const counts={};
+    for(const e of d.acquired) counts[e.brand]=(counts[e.brand]||0)+1;
+    $("tabBody").innerHTML=`<table><thead><tr><th class="l">系列</th><th>店</th>
+      <th>この日</th></tr></thead><tbody>`
+      +Array.from({length:h.brandCount},(_,b)=>{
+        const shops=h.spots.filter(s=>s.brand===b).length;
+        return `<tr><td class="l"><span class="swatch" style="background:${
+          brandColor(b,h.brandCount,false)}"></span>${b}</td><td>${shops}</td>
+          <td>${counts[b]||0}</td></tr>`;
+      }).join("")+"</tbody></table>";
+  }else if(tab==="actions"){
+    $("tabBody").innerHTML=d.actions.map((row,a)=>
+      `<div style="margin-bottom:4px"><strong style="color:${AGENTC[a%AGENTC.length]}">車${a}</strong>
+       <span class="sub"> ${row.length}要素</span><pre>${JSON.stringify(row)}</pre></div>`).join("")
+      +`<div class="sub">負=待機（絶対値が歩数）／ 0〜5=移動方向</div>`;
+  }
+}
+
+$("play").onclick=()=>{ playing=!playing; $("play").textContent=playing?"⏸ 停止":"▶ 再生";
+  $("play").classList.toggle("on",playing); last=performance.now(); };
+$("back").onclick=()=>{ pos=Math.max(0,Math.floor(pos)-1); stop(); draw(); };
+$("fwd").onclick=()=>{ pos=Math.floor(pos)+1; draw(); };
+$("seek").oninput=e=>{ pos=+e.target.value; stop(); draw(); };
+$("follow").onclick=()=>{ follow=!follow; $("follow").classList.toggle("on",follow); };
+$("trail").onclick=()=>{ showTrail=!showTrail; $("trail").classList.toggle("on",showTrail); draw(); };
+$("wide").onclick=()=>{ const m=document.querySelector("main");
+  m.classList.toggle("wide"); $("wide").classList.toggle("on", m.classList.contains("wide"));
+  requestAnimationFrame(draw); };
+function stop(){ playing=false; $("play").textContent="▶ 再生"; $("play").classList.remove("on"); }
+document.querySelectorAll(".spd").forEach(b=>b.onclick=()=>{ speed=+b.dataset.v;
+  document.querySelectorAll(".spd").forEach(x=>x.classList.toggle("on",x===b)); });
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{ tab=b.dataset.t;
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b)); draw(); });
+document.querySelector('.spd[data-v="1"]').classList.add("on");
+$("follow").classList.add("on");
+addEventListener("resize",draw);
+
+// 実時間で進めます。1倍速は1歩0.25秒。
+function tick(now){
+  if(playing&&live){
+    const d=day();
+    if(d){
+      const dt=(now-last)/1000; last=now;
+      pos+=dt*4*speed;
+      if(pos>=d.daySteps){ pos=d.daySteps; stop(); }
+      draw();
+    }
+  }else last=now;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+poll();
+</script>
+</body>
+</html>

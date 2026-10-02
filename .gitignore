@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+models/
+problems/*
+!problems/sample/
+answers/
+viewer/data/*.json
+viewer/data/*.js
+!viewer/data/index.js
+!viewer/data/index.json
+server/procon-server-*
+tmp_server/
+tmp_server_test/
+tmp_verify/
+
+# トークンを書くファイル。絶対に push しない。
+.env

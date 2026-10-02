@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>ヘキサうどん 行動ビューア</title>
+<script>
+  // ブラウザが古い app.js / style.css / データを使い回さないようにする。
+  // 更新したのに画面が変わらない、という事故がここで防げる。
+  window.HEXA_CACHE_BUSTER = "?v=" + Date.now();
+  document.write(
+    '<link rel="stylesheet" href="style.css' + window.HEXA_CACHE_BUSTER + '">'
+  );
+</script>
+</head>
+<body>
+<aside class="panel">
+  <h1>ヘキサうどん 行動ビューア</h1>
+  <p class="subtitle">4体のAIが、いつ・どこで・何をしたか</p>
+
+  <div class="field">
+    <label for="dataset">解答データ</label>
+    <select id="dataset"></select>
+  </div>
+
+  <div class="field">
+    <label for="day">日</label>
+    <select id="day"></select>
+  </div>
+
+  <div class="field">
+    <label>表示するAI</label>
+    <div class="team-list" id="teams"></div>
+  </div>
+
+  <div class="field">
+    <label for="focus">燃料と在庫を見るAI</label>
+    <select id="focus"></select>
+  </div>
+
+  <div class="field">
+    <label>車両の状態</label>
+    <div class="agent-list" id="agents"></div>
+  </div>
+
+  <div class="field">
+    <label>スポットの残り在庫</label>
+    <div class="spot-list" id="spots"></div>
+  </div>
+
+  <div class="field">
+    <label>凡例</label>
+    <div class="legend">
+      <div><i style="background:#d8c9a3"></i>平地（移動2 / 燃料1）</div>
+      <div><i style="background:#9c7a55"></i>山地（移動3 / 燃料2）</div>
+      <div><i style="background:#2e5d74"></i>池（進入できない）</div>
+      <div><i style="background:var(--smooth)"></i>道路・順調（移動1 / 燃料2）</div>
+      <div><i style="background:var(--busy)"></i>道路・混雑（移動2 / 燃料2）</div>
+      <div><i style="background:var(--jammed)"></i>道路・渋滞（移動4 / 燃料2）</div>
+      <div><i style="border-radius:50%;background:#fff"></i>巡回車（丸）</div>
+      <div><i style="transform:rotate(45deg);background:#fff"></i>補給車（ひし形）</div>
+      <div><i style="border:2px solid #fff;background:transparent"></i>スポット（内側の色が系列、数字が残り在庫）</div>
+    </div>
+  </div>
+
+  <div class="inspector" id="inspector">マップのセルをクリックすると、地形と交通量の内訳が出ます。</div>
+</aside>
+
+<main class="stage">
+  <div class="stage-head" id="head"></div>
+  <div class="canvas-wrap"><canvas id="map"></canvas></div>
+  <div class="transport">
+    <button id="play">再生</button>
+    <button id="reset">先頭へ</button>
+    <input id="step" type="range" min="0" max="0" value="0">
+    <select id="speed" title="再生速度">
+      <option value="0.25">0.25倍速</option>
+      <option value="0.5">0.5倍速</option>
+      <option value="1" selected>1倍速</option>
+      <option value="2">2倍速</option>
+      <option value="4">4倍速</option>
+      <option value="8">8倍速</option>
+    </select>
+    <span class="readout" id="readout"></span>
+  </div>
+</main>
+
+<script>
+  document.write('<script src="data/index.js' + window.HEXA_CACHE_BUSTER + '"><\/script>');
+  document.write('<script src="app.js' + window.HEXA_CACHE_BUSTER + '"><\/script>');
+</script>
+</body>
+</html>

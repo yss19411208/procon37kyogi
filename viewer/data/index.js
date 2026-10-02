@@ -1,0 +1,1 @@
+window.HEXA_INDEX = [];
