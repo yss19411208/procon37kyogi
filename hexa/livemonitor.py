@@ -27,6 +27,25 @@ from hexa.rules import AgentKind
 # 既定の書き出し先。ビューアはここを読む。
 LIVE_DIR = Path(__file__).resolve().parent.parent / "viewer" / "live"
 LIVE_NAME = "state.json"
+# **探索中だけ書く、小さいほうのファイル。**
+#
+# `state.json` にはその試合の全部（マップ・全日の1歩ごとの位置）が
+# 入ります。10日目には87KBになり、1回書くのに9.1ミリ秒かかりました。
+# 0.2秒ごとに書くと**探索の4.5%**を監視に使ってしまいます。
+#
+# 過ぎた日の中身は、その日のあいだ変わりません。だから探索中は
+# 「いまの様子＋いま作っている1日ぶん」だけを書きます。10分の1
+# 以下の大きさになり、1ミリ秒で済みます。ビューアはこちらを速く、
+# `state.json` は日が変わったときだけ読みます。
+NOW_NAME = "now.json"
+
+
+# **探索中の書き出しの間隔。**
+#
+# ビューアは届いた瞬間に映すので、ここがそのまま「どれだけ新しい絵が
+# 見られるか」の下限になります。探索中に書くのは小さいほうの
+# ファイル（`NOW_NAME`）だけなので、0.2秒でも探索の0.5%ほどです。
+SEARCH_WRITE_GAP = 0.2
 
 
 class LiveMonitor:
@@ -48,6 +67,27 @@ class LiveMonitor:
                 self.enabled = False
 
     # ---------------- 記録 ----------------
+
+    def waiting(self, reason: str, linked: bool = True) -> None:
+        """**試合が始まるのを待っていることを知らせる。**
+
+        以前は試合が始まるまで何も書きませんでした。そのため
+        ビューアは前の試合のファイルを見るか、読めないままで、
+        **開始3分前なのに「つながりません」**と出ていました。
+        読めないのはビューアとファイルの間の話で、サーバーとの
+        接続とは別のことです。ここで軽いほうだけを書き換えます。
+        """
+
+        if not self.enabled:
+            return
+        self._put(NOW_NAME, {
+            "updatedAt": time.time(),
+            "elapsed": round(time.time() - self.started_at, 1),
+            "status": {"phase": "試合を待っています",
+                       "reason": reason, "linked": bool(linked)},
+            "dayCount": len(self.days),
+            "preview": None,
+        })
 
     def start_match(self, problem: Problem, kinds: tuple[AgentKind, ...]) -> None:
         """試合の始めに1回だけ呼ぶ。マップは大きいのでここでだけ書く。"""
@@ -85,19 +125,27 @@ class LiveMonitor:
         best_score: tuple | None = None,
         resubmissions: int = 0,
         recent: list | None = None,
-        preview: dict | None = None,
+        preview=None,
     ) -> None:
         """探索中の様子。回答時間のあいだ、何度でも呼べる。
 
-        1秒に1回だけ書きます（0.4ミリ秒なので影響はありませんが、
-        無駄に書いても意味がないため）。
+        `SEARCH_WRITE_GAP` 秒に1回だけ書きます（1回0.4ミリ秒なので
+        探索の速さには響きませんが、無駄に書いても意味がないため）。
         """
 
         now = time.monotonic()
-        if now - self._last_search < 0.5:
+        if now - self._last_search < SEARCH_WRITE_GAP:
             return
         self._last_search = now
-        self._write({
+        # **盤面は書くときだけ作ります。**
+        #
+        # 呼ぶ側は候補1件ごとにここへ来ますが、書くのは
+        # `SEARCH_WRITE_GAP` 秒に1回です。ところが Python は引数を
+        # 先に評価するので、盤面を dict で渡すと**書かない回でも
+        # 作られます**。関数で渡してもらい、ここで呼びます。
+        if callable(preview):
+            preview = preview()
+        self._write_now({
             "phase": "探索中",
             "day": day_index + 1,
             "candidates": candidates,
@@ -177,6 +225,25 @@ class LiveMonitor:
 
     # ---------------- 書き出し ----------------
 
+    def _write_now(self, status: dict, preview: dict | None = None) -> None:
+        """**探索中だけの、小さい書き出し。**
+
+        過ぎた日の中身は入れません（その日のあいだ変わらないので、
+        ビューアは `state.json` から一度読めば足ります）。入れると
+        10日目で87KB・9.1ミリ秒になり、探索の4.5%を食います。
+        """
+
+        if not self.enabled:
+            return
+        payload = {
+            "updatedAt": time.time(),
+            "elapsed": round(time.time() - self.started_at, 1),
+            "status": status,
+            "dayCount": len(self.days),
+            "preview": preview,
+        }
+        self._put(NOW_NAME, payload)
+
     def _write(self, status: dict, preview: dict | None = None) -> None:
         """いまの状態を書き出す。
 
@@ -198,16 +265,31 @@ class LiveMonitor:
             "header": self.header,
             "days": days,
         }
-        # 途中まで書いたファイルをビューアに読ませないため、
-        # 一時ファイルに書いてから名前を変える（差し替えは一瞬で終わる）。
-        #
-        # **1回の失敗で監視を止めてはいけません。**
-        # Windows では、ブラウザやウイルス対策がファイルを開いている一瞬に
-        # os.replace が失敗することがあります。以前はそこで enabled を
-        # False にしていたため、**一度詰まると二度と更新されません**でした。
-        # 実戦で「途中から止まる」と報告された症状がこれです。
-        #
-        # 数回続けて失敗したときだけ諦めます。
+        self._put(LIVE_NAME, payload)
+        # 小さいほうも同時に置き換えます。ビューアはこちらを速く
+        # 読むので、段階（試合終了など）がすぐ伝わります。
+        self._put(NOW_NAME, {
+            "updatedAt": payload["updatedAt"],
+            "elapsed": payload["elapsed"],
+            "status": status,
+            "dayCount": len(self.days),
+            "preview": preview,
+        })
+
+    def _put(self, name: str, payload: dict) -> None:
+        """1つのファイルを、途中が見えない形で置き換える。
+
+        途中まで書いたファイルをビューアに読ませないため、一時
+        ファイルに書いてから名前を変える（差し替えは一瞬で終わる）。
+
+        **1回の失敗で監視を止めてはいけません。**
+        Windows では、ブラウザやウイルス対策がファイルを開いている
+        一瞬に os.replace が失敗することがあります。以前はそこで
+        enabled を False にしていたため、**一度詰まると二度と更新
+        されません**でした。実戦で「途中から止まる」と報告された
+        症状がこれです。数回続けて失敗したときだけ諦めます。
+        """
+
         temporary = None
         try:
             handle, temporary = tempfile.mkstemp(
@@ -217,7 +299,7 @@ class LiveMonitor:
                 json.dump(payload, stream, ensure_ascii=False)
             for attempt in range(3):
                 try:
-                    os.replace(temporary, str(self.directory / LIVE_NAME))
+                    os.replace(temporary, str(self.directory / name))
                     temporary = None
                     self._fails = 0
                     return

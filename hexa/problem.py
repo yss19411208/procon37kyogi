@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,9 @@ class Problem:
     players: int
     busy_threshold: int
     jammed_threshold: int
+    # 地形の並び。最初に呼ばれたときに1度だけ作ります
+    # （`frozen=True` なので `object.__setattr__` で入れます）。
+    _terrains: tuple | None = field(default=None, compare=False, repr=False)
 
     @property
     def cell_count(self) -> int:
@@ -51,7 +54,21 @@ class Problem:
         return len(self.agent_positions)
 
     def terrain_at(self, position: int) -> Terrain:
-        return Terrain(self.cells[position])
+        """そのマスの地形。
+
+        **`Terrain(...)` を毎回作らないようにしています。**
+
+        1日ぶんの計画を1回作るだけで600回ほど呼ばれ、磨きでは
+        その再現を何万回も回します。実測（32x32の1日を300回）では
+        enum を作る時間だけで全体の10%でした。問題は作ったあと
+        変わらないので、最初に1度だけ並べて使い回します。
+        """
+
+        table = self._terrains
+        if table is None:
+            table = tuple(Terrain(value) for value in self.cells)
+            object.__setattr__(self, "_terrains", table)
+        return table[position]
 
     def to_json_dict(self) -> dict[str, Any]:
         rows = [

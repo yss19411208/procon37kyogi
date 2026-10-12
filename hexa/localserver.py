@@ -82,16 +82,85 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def local_ip() -> str:
-    """同じLANの別PCから見えるこのPCのアドレスを調べる。"""
+def _address_rank(address: str) -> tuple:
+    """別PCから繋ぐのに向いている順。小さいほど良い。"""
 
+    if address.startswith("127."):
+        return (9, address)          # 自分からしか見えない
+    if address.startswith("169.254."):
+        return (2, address)          # DHCPなし（識別されていないネットワーク）
+    if (address.startswith("192.168.") or address.startswith("10.")
+            or any(address.startswith(f"172.{block}.")
+                   for block in range(16, 32))):
+        return (0, address)          # ふつうのLAN
+    return (1, address)              # それ以外（グローバルなど）
+
+
+def local_ips() -> list[str]:
+    """このPCのIPv4アドレスを、別PCから繋ぎやすい順に並べて返す。
+
+    **なぜ1つでは足りないか**
+
+    以前は「8.8.8.8 へ繋ぐふりをして自分のアドレスを調べる」方式
+    だけでした。既定の経路が決まっていれば正しく出ますが、
+    **LANケーブル直結でインターネットが無いPCでは失敗し、
+    `127.0.0.1` を返していました**。その値を「別のPCから」として
+    表示していたので、相手からは絶対に繋がりません。
+
+    Windowsが「識別されていないネットワーク」と出すのは、DHCPが
+    無くてアドレスが決まらない（169.254.x.x になる）状態です。
+    まさにこの場合に当たります。
+
+    そこで、経路から調べる方法に加えて**ホスト名からの逆引き**でも
+    集め、重複を除いて並べます。候補を全部見せれば、どれかで繋がります。
+    """
+
+    found: list[str] = []
+
+    def add(address: str | None) -> None:
+        if not address or ":" in address:   # IPv6 はここでは扱わない
+            return
+        if address not in found:
+            found.append(address)
+
+    # 1) 既定の経路から（インターネットがあるときはこれが当たり）
+    for probe in ("8.8.8.8", "192.168.1.1", "10.0.0.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(0.2)
+                # 実際には送信しない。経路を決めるためだけに使う。
+                sock.connect((probe, 80))
+                add(sock.getsockname()[0])
+        except OSError:
+            pass
+    # 2) ホスト名から（経路が無くても、挿してあるLANのアドレスが出る）
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            # 実際には送信しない。経路を決めるためだけに使う。
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
+        add(socket.gethostbyname(socket.gethostname()))
     except OSError:
-        return "127.0.0.1"
+        pass
+    try:
+        for entry in socket.getaddrinfo(socket.gethostname(), None,
+                                        socket.AF_INET):
+            add(entry[4][0])
+    except OSError:
+        pass
+    try:
+        for address in socket.gethostbyname_ex(socket.gethostname())[2]:
+            add(address)
+    except OSError:
+        pass
+    found.sort(key=_address_rank)
+    return found or ["127.0.0.1"]
+
+
+def local_ip() -> str:
+    """同じLANの別PCから見えるこのPCのアドレス（いちばん有望なもの）。
+
+    見つからないときだけ `127.0.0.1` を返します。候補が複数あるときは
+    `local_ips()` で全部出せます。
+    """
+
+    return local_ips()[0]
 
 
 @dataclass

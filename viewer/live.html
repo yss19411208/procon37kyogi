@@ -21,6 +21,12 @@
          font-size:11.5px; color:var(--sub); white-space:nowrap; }
   .pill.live{ border-color:var(--good); color:var(--good); }
   .pill.stale{ border-color:var(--bad); color:var(--bad); }
+  /* 接続の丸印。受け取るたびに一瞬光らせて「いま届いた」と分かるようにします。 */
+  .pill.conn{ border-color:var(--good); color:var(--good); }
+  .pill.conn::before{ content:"●"; margin-right:5px; }
+  .pill.down{ border-color:var(--bad); color:var(--bad); }
+  .pill.down::before{ content:"○"; margin-right:5px; }
+  .pill.beat{ background:#2eb87233; }
   .pill.big{ font-weight:700; color:var(--ink); }
   main{ height:calc(100% - 36px); display:grid; gap:8px; padding:8px;
         grid-template-columns:1fr 420px; overflow:hidden; }
@@ -36,6 +42,12 @@
   #stageWrap{ flex:1; min-height:0; display:flex; align-items:center; justify-content:center; }
   #stage{ display:block; }
   .ctl{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:6px; flex:none; }
+  /* 「最新を追う」中は、使えないものを薄くして分かるようにします。 */
+  .ctl.locked button:disabled, .ctl.locked input:disabled{
+    opacity:.35; cursor:not-allowed; }
+  .ctl.locked #follow{ opacity:1; cursor:pointer; }
+  table.locked tbody tr{ cursor:not-allowed; opacity:.75; }
+  #follow.flash{ outline:2px solid var(--warn); outline-offset:1px; }
   button{ font:inherit; font-size:11.5px; padding:3px 9px; border:1px solid var(--line);
           border-radius:5px; background:#1c232b; color:var(--ink); cursor:pointer; }
   button:hover{ border-color:var(--accent); color:var(--accent); }
@@ -71,6 +83,8 @@
   .side .panel:nth-child(4){ flex:1 1 auto; min-height:180px; }
   .try{ font-size:11px; padding:1px 0; display:flex; gap:6px; align-items:center; }
   .try .name{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* 方策の名前は長い。見切れるより折り返すほうが読める。 */
+  .wrapline{ overflow-wrap:anywhere; word-break:break-word; line-height:1.5; }
   /* パネルの中身が枠からはみ出さないようにする */
   .panel, .panel *{ min-width:0; }
   #searchNow{ overflow:hidden; }
@@ -82,12 +96,16 @@
 <body>
 <header>
   <h1>ヘキサうどん 監視</h1>
+  <span id="conn" class="pill">つないでいます…</span>
   <span id="live" class="pill">接続中…</span>
   <span id="phase" class="pill"></span>
   <span id="score" class="pill big"></span>
   <span id="mismatch" class="pill"></span>
   <span id="searchPill" class="pill"></span>
 </header>
+
+<div class="sub" id="connNote"
+     style="display:none;padding:4px 12px;color:var(--bad)"></div>
 
 <main>
   <section class="panel board">
@@ -105,7 +123,10 @@
       <button id="follow">最新を追う</button>
       <button id="trail" class="on">軌跡</button>
       <button id="wide">盤面を広く</button>
+      <button id="openLog">記録を開く</button>
+      <input id="logFile" type="file" accept=".json" style="display:none">
     </div>
+    <div class="sub" id="followNote" style="margin-top:4px;color:var(--warn)"></div>
     <div class="sub" id="legend" style="margin-top:4px"></div>
   </section>
 
@@ -146,8 +167,23 @@ const TNAME = ["平地","道路","山地","池"];
 const ROADEDGE = [null, "#e8992e", "#ef4f4f"];
 const AGENTC = ["#4c8ef7","#2eb872","#c77dff","#ff9f43","#3ddad7","#ff6b81","#b5e48c"];
 
+// **車の大きさ。** 一回り小さくしてあります。重なったときに
+// 縮めるのではなく、はじめから小さく描いて少しどかすためです。
+const AGENT_R=0.82;
 let live=null, pickedDay=-1, pos=0, playing=false, speed=1, follow=true, tab="days";
-let last=0, showTrail=true;
+let last=0, showTrail=true, lastSig="";
+
+/* いま映している案の指紋。これが変わったら「新しい最善案」です。 */
+function planSignature(d){
+  if(!d) return "";
+  let hash=2166136261;
+  const text=(d.label||"")+"|"+(d.noodleTotal||0)+"|"
+    +((d.tracks||[]).map(t=>t.join(",")).join(";"));
+  for(let i=0;i<text.length;i++){
+    hash^=text.charCodeAt(i); hash=(hash*16777619)>>>0;
+  }
+  return d.day+":"+hash;
+}
 const $=id=>document.getElementById(id);
 
 /* 系列の色。色相を均等に割り、明度と彩度を交互に変えて隣を見分けやすくします。 */
@@ -159,23 +195,220 @@ function brandColor(brand, count, dim){
   return `hsl(${hue.toFixed(0)} ${sat}% ${lit}%)`;
 }
 
+/* **届いた瞬間に映します。**
+
+   これまでは0.6秒ごとに取りに行き、中身が同じでも毎回 JSON を
+   組み立て直して描き直していました。いまは
+
+     - 速く取りに行く（既定0.15秒ごと）
+     - **本文が前と同じなら、組み立ても描き直しもしない**
+     - 変わらない時間が続いたら、ゆっくりに落とす（最大0.6秒）
+
+   という形にします。変わっていないときの費用は「小さな本文を
+   読んで文字列を比べるだけ」なので、PCの負担はむしろ減ります。
+   変わった瞬間はすぐ映ります。 */
+const POLL_FAST=150, POLL_SLOW=600;
+let lastText="", quiet=0, pollWait=POLL_FAST;
+
+/* **「つながっている」と「試合が動いている」は別のことです。**
+
+   前は fetch が失敗した時点で「つながりません」と出していました。
+   そのため、**試合開始3分前**（まだ live/state.json が無い）でも
+   「つながりません」になっていました。読めないのはビューアと
+   ファイルの間の話で、サーバーとの接続とは関係ありません。
+
+   いまは3つに分けます。
+
+     読めない   : ビューアが state.json を読めない（理由を出す）
+     待機中     : 読めたが、まだ試合が始まっていない
+     受信中     : 読めて、中身が動いている
+     試合終了   : 読めて、試合が終わっている
+*/
+let lastError="";
+
+function beat(state, detail){
+  const pill=$("conn");
+  const face={
+    down:   ["読めません", "pill down"],
+    wait:   ["待機中", "pill conn"],
+    live:   ["受信中", "pill conn"],
+    done:   ["試合終了", "pill"],
+  }[state] || ["—", "pill"];
+  pill.textContent = face[0];
+  pill.className = face[1];
+  if(state==="live"){ pill.classList.add("beat");
+                      setTimeout(()=>pill.classList.remove("beat"),140); }
+  // **読めないときは、理由をそのまま出します。**
+  // 「つながりません」だけでは何を直せばよいか分かりません。
+  const note=$("connNote");
+  if(state==="down"){
+    lastError=detail||"";
+    note.textContent="live/state.json を読めません: "+lastError
+      +"（監視つきで動かしているか、viewer フォルダから配信しているかを確かめてください）";
+    note.style.display="";
+  }else if(state==="wait" && detail){
+    note.textContent=detail;
+    note.style.display="";
+  }else{
+    note.style.display="none";
+  }
+}
+
+/* **過ぎた試合の記録を開きます。**
+
+   `logs/match_*.json` は生中継とほぼ同じ形で保存してあります
+   （マップ・店・渋滞・1歩ごとの位置まで入っています）。足りないのは
+   `status` と `updatedAt` だけなので、それを足して同じ描き方に
+   そのまま渡します。開いているあいだは受信を止めます。 */
+let replay=false;
+
+function openLog(file){
+  const reader=new FileReader();
+  reader.onload=()=>{
+    try{
+      const data=JSON.parse(reader.result);
+      if(!data.header||!data.days) throw new Error("試合の記録ではありません");
+      replay=true;
+      follow=false;
+      live={
+        updatedAt: data.savedAt||0,
+        elapsed: data.elapsed||0,
+        status: {phase:"記録（"+(file.name||"")+"）",
+                 day:data.days.length, score:data.score||"",
+                 mismatches:data.mismatches||[]},
+        header: data.header,
+        days: data.days,
+      };
+      pickedDay=live.days.length-1; pos=0; stop();
+      beat("done");
+      $("connNote").textContent="記録を見ています: "+(file.name||"")
+        +"（生中継に戻すには再読み込み）";
+      $("connNote").style.display="";
+      lockControls(); draw();
+    }catch(error){
+      beat("down", "記録を読めません: "+String(error&&error.message||error));
+    }
+  };
+  reader.onerror=()=>beat("down","記録を読めません");
+  reader.readAsText(file);
+}
+
+/* 受け取った中身から、いまの段階を決めます。 */
+function phaseState(data){
+  if(!data) return "wait";
+  const phase=(data.status&&data.status.phase)||"";
+  if(phase.indexOf("終了")>=0) return "done";
+  // 試合前は「待機中」。サーバーに届いているかは linked で分かります。
+  if(phase.indexOf("待っています")>=0)
+    return (data.status.linked===false) ? "down" : "wait";
+  if(!data.header||!data.header.cells) return "wait";
+  const age=Date.now()/1000-(data.updatedAt||0);
+  return age<10 ? "live" : "wait";
+}
+
+/* **読むファイルを2つに分けています。**
+
+   `state.json` には試合の全部（マップ・全日の1歩ごとの位置）が
+   入っていて、10日目には87KBになります。探索中にこれを0.2秒ごとに
+   書くと、書く側が**探索の4.5%**を取られます。
+
+   そこで探索中は `now.json`（いまの様子＋作りかけの1日ぶん、数KB）
+   だけを書き、`state.json` は日が変わったときに書きます。
+   ビューアは now.json を速く読み、日が増えたときだけ state.json を
+   取り直します。見え方は同じで、探索は削りません。
+
+   now.json が無い（古い書き出し）ときは、state.json だけを読む
+   これまでのやり方に戻します。 */
+let base=null, baseDays=-1, useNow=true;
+
+async function fetchBase(){
+  const r=await fetch("live/state.json?t="+Date.now(),{cache:"no-store"});
+  if(!r.ok) throw new Error("HTTP "+r.status+" "+(r.statusText||""));
+  base=JSON.parse(await r.text());
+  baseDays=(base.days||[]).length;
+  return base;
+}
+
 async function poll(){
+  if(replay){ setTimeout(poll,POLL_SLOW); return; }
   try{
+    if(useNow){
+      const r=await fetch("live/now.json?t="+Date.now(),{cache:"no-store"});
+      if(r.status===404){ useNow=false; setTimeout(poll,0); return; }
+      if(!r.ok) throw new Error("HTTP "+r.status+" "+(r.statusText||""));
+      const text=await r.text();
+      if(text===lastText){
+        if(++quiet>6) pollWait=POLL_SLOW;
+        beat(phaseState(live));
+        setTimeout(poll,pollWait);
+        return;
+      }
+      lastText=text; quiet=0; pollWait=POLL_FAST;
+      const now=JSON.parse(text);
+      const phase=(now.status&&now.status.phase)||"";
+      if(phase.indexOf("待っています")>=0){
+        // まだ試合前。盤面はありません。理由だけ出します。
+        beat(now.status.linked===false ? "down" : "wait",
+             now.status.reason||"");
+        $("phase").textContent=phase;
+        const note=$("connNote");
+        note.textContent=phase+"：" + (now.status.reason||"");
+        note.style.display="";
+        setTimeout(poll,pollWait);
+        return;
+      }
+      if(base===null || now.dayCount!==baseDays) await fetchBase();
+      const days=(base.days||[]).slice();
+      if(now.preview) days.push(now.preview);
+      const next={updatedAt:now.updatedAt, elapsed:now.elapsed,
+                  status:now.status, header:base.header, days:days};
+      beat(phaseState(next));
+      const grew=live&&next.days.length>live.days.length;
+      live=next;
+      if(follow){
+        pickedDay=live.days.length-1;
+        const sig=planSignature(live.days[pickedDay]);
+        if(grew||sig!==lastSig){ pos=0; lastSig=sig; }
+        if(!playing){ playing=true; $("play").textContent="⏸ 停止";
+                      $("play").classList.add("on"); last=performance.now(); }
+      }
+      lockControls();
+      draw();
+      setTimeout(poll,pollWait);
+      return;
+    }
     const r=await fetch("live/state.json?t="+Date.now(),{cache:"no-store"});
     if(r.ok){
-      const next=await r.json();
-      const grew=live&&next.days.length>live.days.length;
-      const searching=(next.status||{}).phase==="探索中";
-      live=next;
-      if(follow&&(grew||pickedDay<0||searching)){
-        pickedDay=live.days.length-1;
-        // 探索中は暫定案が入れ替わるので、再生位置は保ったまま日だけ合わせる
-        if(grew||pickedDay<0) pos=0;
+      const text=await r.text();
+      if(text===lastText){
+        // 中身が同じ。描き直さずに間隔だけ伸ばします。
+        if(++quiet>6) pollWait=POLL_SLOW;
+        beat(phaseState(live));
+        setTimeout(poll,pollWait);
+        return;
       }
+      lastText=text; quiet=0; pollWait=POLL_FAST;
+      const next=JSON.parse(text);
+      beat(phaseState(next));
+      const grew=live&&next.days.length>live.days.length;
+      live=next;
+      if(follow){
+        pickedDay=live.days.length-1;
+        // **新しい最善案が出るたびに0歩から流し直します。**
+        //
+        // 以前は再生位置を保っていたので、案が入れ替わった瞬間に
+        // 途中の歩から別の動きが始まり、何が変わったのか
+        // 分からなくなっていました。
+        const sig=planSignature(live.days[pickedDay]);
+        if(grew||sig!==lastSig){ pos=0; lastSig=sig; }
+        if(!playing){ playing=true; $("play").textContent="⏸ 停止";
+                      $("play").classList.add("on"); last=performance.now(); }
+      }
+      lockControls();
       draw();
-    }
-  }catch(e){}
-  setTimeout(poll,600);
+    } else { beat("down", "HTTP "+r.status+" "+(r.statusText||"")); }
+  }catch(e){ beat("down", String(e&&e.message||e)); pollWait=POLL_SLOW; }
+  setTimeout(poll,pollWait);
 }
 function day(){ return (live&&live.days.length)
   ? live.days[Math.min(Math.max(pickedDay,0),live.days.length-1)] : null; }
@@ -249,9 +482,11 @@ function search(st){
   if(st.phase==="探索中"){
     pill.textContent=`探索中 残り${st.secondsLeft}秒 / ${st.candidates}件`;
     pill.className="pill live";
+    // **名前が長いと見切れていました。** 方策の名前は
+    // 「S1-AI-4+探索0.05」のように伸びるので、折り返させます。
     $("searchNow").innerHTML=
-      `<div>試行中 <strong style="color:var(--ink)">${st.trying||"—"}</strong></div>`
-      +`<div>最良 <strong style="color:var(--good)">${st.bestLabel||"—"}</strong>`
+      `<div class="wrapline">試行中 <strong style="color:var(--ink)">${st.trying||"—"}</strong></div>`
+      +`<div class="wrapline">最良 <strong style="color:var(--good)">${st.bestLabel||"—"}</strong>`
       +(st.bestScore?` <span class="sub">${st.bestScore.join("/")}</span>`:"")
       +` <span class="sub">／ ${st.candidates}件 ／ 出直${st.resubmissions||0}</span></div>`;
     $("searchList").innerHTML=(st.recent||[]).map(r=>
@@ -261,7 +496,10 @@ function search(st){
       || `<div class="sub">まだありません</div>`;
   }else{
     pill.textContent=""; pill.className="pill";
-    $("searchNow").innerHTML=`<span class="sub">いまは探索していません（提出済み）</span>`;
+    const done=(st.phase||"").indexOf("終了")>=0;
+    $("searchNow").innerHTML=`<span class="sub">`
+      + (done ? "この試合は終わりました。" : "いまは探索していません（提出済み）")
+      + `</span>`;
     $("searchList").innerHTML="";
   }
 }
@@ -332,34 +570,83 @@ function board(h,d,line){
     hex(ctx,x,y,r*0.66);
     ctx.fillStyle=col; ctx.fill();
     ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(1, r*0.11); ctx.stroke();
-    // 在庫は店の下の点。残り=明るい赤、取った分=暗い赤。
-    const dot=Math.max(1.2,r*0.095), gap=dot*2.6, w=(sp.stocks-1)*gap;
+    // **在庫の点は店の外（下）に出します。**
+    //
+    // 以前は店の六角形の中（y+0.44r）に赤い点を描いていました。
+    // 系列の色は色相を均等に割って作るので、赤に近い系列だと
+    // 点が溶けて見えません。また在庫5の店では点の列が
+    // マスの幅を超えて隣とぶつかっていました。
+    //
+    // いまは六角形の下に黒い台を敷き、**残り=白 / 取った分=濃い灰**で
+    // 描きます。白と黒はどの色相の上でも見分けられます。
+    // 台の幅はマスに収まるよう、点の数で間隔を詰めます。
+    const band=r*1.34;
+    const dot=Math.min(Math.max(1.2,r*0.1), band/(sp.stocks*2.4));
+    const gap=Math.min(dot*2.6, (band-dot*2)/Math.max(1,sp.stocks-1));
+    const w=(sp.stocks-1)*gap;
+    const by=y+r*0.86, pad=dot*1.5;
+    ctx.beginPath();
+    ctx.roundRect(x-w/2-pad, by-dot-pad*0.6, w+pad*2, dot*2+pad*1.2, dot+1);
+    ctx.fillStyle="#000c"; ctx.fill();
+    ctx.strokeStyle="#ffffff44"; ctx.lineWidth=1; ctx.stroke();
     for(let k=0;k<sp.stocks;k++){
-      ctx.beginPath(); ctx.arc(x-w/2+k*gap, y+r*0.44, dot, 0, 7);
-      ctx.fillStyle=k<left?"#ff5d5d":"#5a2020"; ctx.fill();
+      ctx.beginPath(); ctx.arc(x-w/2+k*gap, by, dot, 0, 7);
+      ctx.fillStyle=k<left?"#ffffff":"#555"; ctx.fill();
     }
   }
 
   if(d&&line){
+    // **同じマスに重なった車をずらします。**
+    //
+    // 重なると丸も番号も完全に隠れ、「文字が重なっている」状態に
+    // なります。何台いるか数えて、小さな輪の上に並べます。
+    const spotsOf=new Map(), place=[];
     for(let a=0;a<h.agentKinds.length;a++){
       const i=Math.min(Math.floor(pos),line.total-1);
       const seg=line.paths[a][Math.max(0,i)];
-      if(!seg) continue;
+      if(!seg){ place.push(null); continue; }
       const frac=pos-Math.floor(pos);
       const t=seg.move?frac:0;
-      const x=X(seg.f)+(X(seg.t)-X(seg.f))*t, y=Y(seg.f)+(Y(seg.t)-Y(seg.f))*t;
+      const px=X(seg.f)+(X(seg.t)-X(seg.f))*t, py=Y(seg.f)+(Y(seg.t)-Y(seg.f))*t;
+      // 同じ場所（丸め）に何台いるか
+      const key=Math.round(px/2)+","+Math.round(py/2);
+      const list=spotsOf.get(key)||[]; list.push(a); spotsOf.set(key,list);
+      place.push({px,py,key,seg});
+    }
+    for(let a=0;a<h.agentKinds.length;a++){
+      const p=place[a];
+      if(!p) continue;
+      const seg=p.seg;
+      const mates=spotsOf.get(p.key)||[a];
+      let x=p.px, y=p.py;
+      if(mates.length>1){
+        // **大きさは変えず、少しどかすだけにします。**
+        //
+        // 以前は重なったときだけ 0.62 倍に縮めていました。車が
+        // 近づくたびに大きさが変わるので、どれが同じ車なのか
+        // 目で追えません。車はもともと一回り小さく描いておき
+        // （AGENT_R）、重なったら輪の上へずらすだけにします。
+        const k=mates.indexOf(a), n=mates.length;
+        const rad=r*(n>3?0.40:0.32), ang=-Math.PI/2+k*2*Math.PI/n;
+        x+=Math.cos(ang)*rad; y+=Math.sin(ang)*rad;
+      }
       const col=AGENTC[a%AGENTC.length], sup=h.agentKinds[a]===1;
+      const sz=AGENT_R;   // 何台重なっても大きさは変えません
       ctx.beginPath();
-      if(sup) ctx.rect(x-r*0.44,y-r*0.44,r*0.88,r*0.88); else ctx.arc(x,y,r*0.5,0,7);
+      if(sup) ctx.rect(x-r*0.44*sz,y-r*0.44*sz,r*0.88*sz,r*0.88*sz);
+      else ctx.arc(x,y,r*0.5*sz,0,7);
       ctx.fillStyle=col; ctx.fill();
       ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(1, r*0.1); ctx.stroke();
       // 数字は白で固定。色が濃くても薄くても読めるよう、黒い縁取りを付ける。
-      ctx.font=`800 ${Math.max(9,r*0.62)}px system-ui`;
+      ctx.font=`800 ${Math.max(8,r*0.62*sz)}px system-ui`;
       ctx.lineWidth=Math.max(1.6, r*0.16); ctx.strokeStyle="#000";
       ctx.strokeText(a,x,y);
       ctx.fillStyle="#fff"; ctx.fillText(a,x,y);
       if(!sup){
-        const f=fuel(d,a,pos,h.fuelLimit), bw=r*1.3, bx=x-bw/2, by=y+r*0.66, bh=Math.max(2.5,r*0.13);
+        // **燃料バーは車の上に描きます。** 下は在庫の点の台が使うので、
+        // 以前は在庫とバーが重なって読めませんでした。
+        const f=fuel(d,a,pos,h.fuelLimit), bw=r*1.1*sz, bx=x-bw/2,
+              by=y-r*0.80, bh=Math.max(2.5,r*0.12);
         ctx.fillStyle="#000b"; ctx.fillRect(bx-1,by-1,bw+2,bh+2);
         ctx.fillStyle=f.ratio>.5?"#2eb872":f.ratio>.2?"#e8992e":"#ef4f4f";
         ctx.fillRect(bx,by,bw*f.ratio,bh);
@@ -437,7 +724,33 @@ function dayTableHtml(){
       <td>${d.candidates}</td><td>${(d.refuelEvents||[]).length}</td></tr>`;
     }).join("")+"</tbody>";
 }
-function pick(i){ pickedDay=i; pos=0; follow=false; $("follow").classList.remove("on"); draw(); }
+function pick(i){
+  // **「最新を追う」中は日を変えられません。**
+  // 追いかけている最中に日を変えても、次の受信でまた最新に戻って
+  // しまい、押しても戻る不思議な動きになっていました。
+  if(follow){ flash(); return; }
+  pickedDay=i; pos=0; draw();
+}
+
+/* 「最新を追う」が入っていることを知らせる */
+function flash(){
+  const b=$("follow");
+  b.classList.add("flash");
+  setTimeout(()=>b.classList.remove("flash"),600);
+}
+
+/* 操作できるものを切り替える。追いかけ中は見た目でも分かるようにします。 */
+function lockControls(){
+  const ids=["play","back","fwd","seek"];
+  for(const id of ids) $(id).disabled=follow;
+  document.querySelectorAll(".spd").forEach(b=>b.disabled=follow);
+  document.querySelector(".ctl").classList.toggle("locked",follow);
+  $("followNote").textContent = follow
+    ? "最新を追っています（日の切り替え・再生・スライダーは使えません）"
+    : "";
+  document.querySelectorAll("#tabBody table").forEach(
+    t=>t.classList.toggle("locked",follow));
+}
 
 function agents(h,d,line){
   if(!d){ $("agentTable").innerHTML=""; return; }
@@ -501,7 +814,17 @@ $("play").onclick=()=>{ playing=!playing; $("play").textContent=playing?"⏸ 停
 $("back").onclick=()=>{ pos=Math.max(0,Math.floor(pos)-1); stop(); draw(); };
 $("fwd").onclick=()=>{ pos=Math.floor(pos)+1; draw(); };
 $("seek").oninput=e=>{ pos=+e.target.value; stop(); draw(); };
-$("follow").onclick=()=>{ follow=!follow; $("follow").classList.toggle("on",follow); };
+$("follow").onclick=()=>{
+  follow=!follow;
+  $("follow").classList.toggle("on",follow);
+  if(follow){
+    // 追いかけ始めたら、最新の日の0歩から流し続けます。
+    pickedDay=live?live.days.length-1:-1; pos=0; playing=true;
+    $("play").textContent="⏸ 停止"; $("play").classList.add("on");
+    last=performance.now();
+  }
+  lockControls(); draw();
+};
 $("trail").onclick=()=>{ showTrail=!showTrail; $("trail").classList.toggle("on",showTrail); draw(); };
 $("wide").onclick=()=>{ const m=document.querySelector("main");
   m.classList.toggle("wide"); $("wide").classList.toggle("on", m.classList.contains("wide"));
@@ -512,7 +835,11 @@ document.querySelectorAll(".spd").forEach(b=>b.onclick=()=>{ speed=+b.dataset.v;
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{ tab=b.dataset.t;
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b)); draw(); });
 document.querySelector('.spd[data-v="1"]').classList.add("on");
+$("openLog").onclick=()=>$("logFile").click();
+$("logFile").onchange=e=>{ if(e.target.files&&e.target.files[0])
+                             openLog(e.target.files[0]); };
 $("follow").classList.add("on");
+lockControls();
 addEventListener("resize",draw);
 
 // 実時間で進めます。1倍速は1歩0.25秒。
@@ -522,7 +849,10 @@ function tick(now){
     if(d){
       const dt=(now-last)/1000; last=now;
       pos+=dt*4*speed;
-      if(pos>=d.daySteps){ pos=d.daySteps; stop(); }
+      if(pos>=d.daySteps){
+        // **追いかけ中はループ再生**。止めずに0歩へ戻します。
+        if(follow) pos=0; else { pos=d.daySteps; stop(); }
+      }
       draw();
     }
   }else last=now;

@@ -46,7 +46,14 @@ def build_visualization(result: MatchResult, title: str) -> dict:
                         for event in day_result.acquisitions
                     ],
                     "refuels": [
-                        {"step": event.step, "agent": event.agent_index, "pos": event.position}
+                        # **入った量も残します。** 日ごとの一覧で
+                        # 「その日に何燃料配れたか」を出すのに使います。
+                        # 準決勝32x32の解析では、1位に並ぶのに要るのは
+                        # 1台1日あたり20燃料だけでした。
+                        {"step": event.step, "agent": event.agent_index,
+                         "pos": event.position,
+                         "before": event.fuel_before,
+                         "after": event.fuel_after}
                         for event in day_result.refuels
                     ],
                     "stayCounts": [

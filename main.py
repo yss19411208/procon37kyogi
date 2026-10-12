@@ -756,9 +756,47 @@ def menu_serve() -> None:
         host="0.0.0.0",
     )
     address = server.base_url
+    port = address.rsplit(":", 1)[1]
     print("  サーバーを起動しました。")
-    print(f"    このPCから  : http://127.0.0.1:{address.rsplit(':', 1)[1]}")
-    print(f"    別のPCから  : {address}")
+    print(f"    このPCから  : http://127.0.0.1:{port}")
+    print()
+    print("  別のPCからは、下のどれかで繋がります（上から試してください）:")
+    from hexa.localserver import local_ips
+
+    candidates = [found for found in local_ips() if not found.startswith("127.")]
+    if candidates:
+        for found in candidates:
+            note = ""
+            if found.startswith("169.254."):
+                note = "  ← DHCPなし。相手も169.254なら繋がります"
+            print(f"    http://{found}:{port}{note}")
+    else:
+        print("    （LANのアドレスが見つかりません。下の確認をしてください）")
+    print()
+    print("  **繋がらないときの確認（Windows）**")
+    print("   1. ネットワークが「識別されていないネットワーク」と出る場合、")
+    print("      DHCPがありません。両方のPCに固定IPを入れてください。")
+    print("      例: このPC 192.168.50.1 / 相手 192.168.50.2")
+    print("          サブネットマスクはどちらも 255.255.255.0")
+    print("          （設定 → ネットワーク → アダプターのオプション →")
+    print("           IPv4 → 次のIPアドレスを使う）")
+    print("   2. ファイアウォールが受信を止めていることがあります。")
+    print("      これはこの画面から開けられます（下で聞きます）。")
+    print("   3. 相手のPCから届くかは、相手で次を実行すると分かります:")
+    for found in (candidates or ["<このPCのIP>"]):
+        print(f"        ping {found}")
+        print(f"        curl http://{found}:{port}/")
+        break
+    print()
+    opened = False
+    if ask_yes_no("ファイアウォールでこのポートの受信を許可しますか", True):
+        done, message = open_firewall(int(port))
+        print(f"  {'成功' if done else '失敗'}: {message}")
+        if done:
+            opened = True
+        else:
+            print("  許可の画面で「いいえ」を押した場合は、もう一度14番を")
+            print("  選び直してください。")
     print()
     print("  別のPCで「8. 本番モードで戦う」を選び、上のURLと下のトークンを入れてください。")
     for index, token in enumerate(tokens):
@@ -777,6 +815,155 @@ def menu_serve() -> None:
         print("  サーバーを止めます。")
     finally:
         server.stop()
+        if opened and ask_yes_no("ファイアウォールの許可を元に戻しますか", True):
+            done, message = close_firewall(int(port))
+            print(f"  {'成功' if done else '失敗'}: {message}")
+
+
+
+
+def _firewall_rule_name(port: int) -> str:
+    return f"ヘキサうどん {port}"
+
+
+def open_firewall(port: int) -> tuple[bool, str]:
+    """Windowsのファイアウォールで、このポートの受信を許可する。
+
+    **なぜプログラム側でやるか**
+
+    LANでPC同士を繋ぐとき、繋がらない原因のほとんどは固定IPと
+    ファイアウォールです。固定IPはWindowsの設定でしか変えられ
+    ませんが、ファイアウォールはここから開けられます。
+
+    管理者の権限が要るので、`Start-Process -Verb RunAs` で昇格を
+    頼みます。画面に「はい／いいえ」の確認（UAC）が出るので、
+    **対話だけで済み、コマンドを打つ必要はありません**。
+
+    Windows以外では何もしません（macOSやLinuxでは、ふつう
+    LAN内の受信は止まっていません）。
+    """
+
+    import platform
+    import subprocess
+
+    if platform.system() != "Windows":
+        return (True, "Windowsではないので、何もしていません。")
+    name = _firewall_rule_name(port)
+    inner = (
+        f"netsh advfirewall firewall delete rule name=\\\"{name}\\\" "
+        f"> $null 2>&1; "
+        f"netsh advfirewall firewall add rule "
+        f"name=\\\"{name}\\\" dir=in action=allow protocol=TCP "
+        f"localport={port}"
+    )
+    command = (
+        "Start-Process -FilePath powershell -Verb RunAs -Wait "
+        f"-ArgumentList '-NoProfile','-Command','{inner}'"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        return (False, "powershell が見つかりません。")
+    except subprocess.TimeoutExpired:
+        return (False, "確認の画面が返ってきませんでした。")
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else "理由は分かりません"
+        return (False, f"許可できませんでした（{reason}）。")
+    return (True, f"ポート{port}の受信を許可しました（規則名「{name}」）。")
+
+
+def close_firewall(port: int) -> tuple[bool, str]:
+    """`open_firewall` で入れた規則を消す。試合が終わったあとに使う。"""
+
+    import platform
+    import subprocess
+
+    if platform.system() != "Windows":
+        return (True, "Windowsではないので、何もしていません。")
+    name = _firewall_rule_name(port)
+    inner = (
+        f"netsh advfirewall firewall delete rule "
+        f"name=\\\"{name}\\\""
+    )
+    command = (
+        "Start-Process -FilePath powershell -Verb RunAs -Wait "
+        f"-ArgumentList '-NoProfile','-Command','{inner}'"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return (False, "消せませんでした。")
+    if done.returncode != 0:
+        return (False, "消せませんでした。")
+    return (True, f"規則「{name}」を消しました。")
+
+
+def _explain_connection_failure(base_url: str) -> None:
+    """繋がらないときに、**どこを見ればよいか**を順に出す。
+
+    LANでPC同士を繋ぐときの失敗は、ほぼこの4つに収まります。
+    Windowsが「識別されていないネットワーク」と出すのは1番です。
+    """
+
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url if "//" in base_url else "http://" + base_url)
+    host = parsed.hostname or ""
+    port = parsed.port or 80
+    print()
+    print("  == 繋がらないときの確認 ==")
+    if host in ("127.0.0.1", "localhost", "::1"):
+        print("   このURLは**自分自身**を指しています。別のPCのサーバーに")
+        print("   繋ぐなら、相手のPCのLANのアドレスを入れてください。")
+        print("   相手のPCの「14. 練習用サーバーを立てる」が表示します。")
+        return
+    # 1) 名前が引けるか
+    try:
+        socket.gethostbyname(host)
+    except OSError:
+        print(f"   1. 「{host}」という名前が引けません。")
+        print("      IPアドレスを直に入れてください（例 http://192.168.50.1:8080）。")
+    # 2) TCPで届くか
+    reach = False
+    try:
+        with socket.create_connection((host, port), timeout=1.5):
+            reach = True
+    except OSError as error:
+        print(f"   2. {host}:{port} に届きません（{type(error).__name__}）。")
+    if reach:
+        print(f"   2. {host}:{port} には届いています。")
+        print("      → URLの綴り（http:// と ポート番号）とトークンを見直してください。")
+        return
+    print()
+    print("   この順に試してください（Windows）。")
+    print("   A. 「識別されていないネットワーク」と出ていませんか。")
+    print("      DHCPが無い状態です。両方のPCに固定IPを入れます。")
+    print("        サーバー側 192.168.50.1 / こちら 192.168.50.2")
+    print("        サブネットマスク どちらも 255.255.255.0")
+    print("        （設定 → ネットワークとインターネット → アダプターの")
+    print("         オプション → IPv4 → 次のIPアドレスを使う）")
+    print("      ※ 無線と有線の両方が繋がっていると、どちらを使うか")
+    print("         迷います。試合中は無線を切るのが確実です。")
+    print(f"   B. サーバー側のファイアウォールが受信を止めていませんか。")
+    print("      サーバー側の管理者PowerShellで:")
+    print(f'        New-NetFirewallRule -DisplayName "procon{port}" '
+          f'-Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow')
+    print(f"   C. 相手まで届くかを確かめます（このPCで）:")
+    print(f"        ping {host}")
+    print("      ping が通ってポートだけ駄目なら B です。")
+    print("      ping も通らなければ A か、ケーブル・ハブの問題です。")
+    print("   D. サーバー側が待ち受けているかを、サーバー側のPCで:")
+    print(f"        netstat -ano | findstr :{port}")
+    print("      0.0.0.0:ポート と出ていれば、外からの受信を待っています。")
+    print("      127.0.0.1:ポート しか無ければ、14番で立て直してください。")
 
 
 def menu_connection_test() -> None:
@@ -796,7 +983,7 @@ def menu_connection_test() -> None:
     print()
     print(f"  {'成功' if ok else '失敗'}: {message}")
     if not ok:
-        print("  URLの綴り、ポート番号、トークン、ファイアウォールを確認してください。")
+        _explain_connection_failure(base_url)
         return
     try:
         problem, _raw = client.get_setting()
@@ -842,6 +1029,20 @@ def menu_online() -> None:
         if viewer_url:
             print(f"  監視: {viewer_url}")
     client = ProconClient(base_url, token)
+
+    # **繋がるかを先に見ます。**
+    #
+    # 試合が始まってから「繋がりません」だけ出ても、どこが悪いのか
+    # 分かりません。LANでPC同士を繋ぐときは、ほぼ固定IPか
+    # ファイアウォールのどちらかです。先に切り分けを出します。
+    ok, message = client.check_connection()
+    print()
+    print(f"  通信: {'成功' if ok else '失敗'}（{message}）")
+    if not ok:
+        _explain_connection_failure(base_url)
+        print()
+        if not ask_yes_no("それでもこのまま進みますか", False):
+            return
 
     try:
         if mode == "production":
@@ -1060,6 +1261,70 @@ def menu_auto_train() -> None:
         validation_per_archetype=per_archetype,
         allow_growth=allow_growth,
     )
+
+
+# このビルドの版。pull したものが最新かどうかを目で確かめるためのものです。
+#
+# 番号の意味（大きいほど新しい）
+#   1桁目: 作りを大きく変えたとき
+#   2桁目: 仕組みを足したり、成績が変わる修正をしたとき
+#   3桁目: 表示や記録まわりの小さな修正
+#
+# 変更の履歴は docs/FINAL_AUDIT.md に書いてあります。
+BUILD_VERSION = "1.53.3"
+BUILD_NOTE = ("**種類の提出に失敗しても試合が止まりません**"
+              "（2026-10-11の準決勝で `AccessTimeError: agent kind "
+              "submission is closed` で試合そのものが落ちました）。"
+              "種類の提出（90秒）は行動の提出（1日60秒）とは別の枠なので、"
+              "間に合わなくても試合は戦えます"
+              " / さらに**1日目にサーバーが返す本当の種類に合わせ直します**。"
+              "状態には1体ごとの `kind` が入っているのでそれが正です"
+              " / **子プロセスの起動時間も種別選択の持ち時間から引きます。**"
+              "24x24の持ち時間90秒に対しこちらは63秒を使いますが、"
+              "起動（Windowsで11個・約10秒）がその63秒に入っていませんでした"
+              " / **補給車を「追いかける」から「待ち伏せる」に変えました。**"
+              "その車の順路の先で先回りして待ちます。15試合で"
+              "順位合計 195→**174**、玉 3836→**3975**、日別も+3。"
+              "手数2000では 163→**151**"
+              " / **17通り測って、勝ったのは2つだけ**でした"
+              "（待ち伏せと `design_cover` のバグ修正）。負けた15通りは"
+              "全部**既定オフで同梱**してあります"
+              "（近づく手・夜合流・逆回りループ・在庫の重み・"
+              "補給の見込み0.25杯・出発点の多様性・設計を種に入れる・"
+              "予約の記帳・救援を先に・余裕0・補給車2台・"
+              "**時刻つきの待ち合わせ**・**届く台数の重み**）"
+              " / **負け方に共通点があります。** 構造を変えた4つ"
+              "（ハブ／夜合流／逆回りループ／時刻つき待ち合わせ）は、"
+              "どれも補給車を1か所・1つの約束に縛る形でした。磨きが"
+              "順路を変え続けるので、縛るとすぐ古くなります。勝った"
+              "待ち伏せだけが**毎歩その場で決め直す**形でした"
+              " / **物理的な上限はまだ15〜30%残っています**"
+              "（2位まで中央値あと12玉）。頭打ちなのはつまみで、"
+              "上限ではありません。次の筋は `docs/POLISH.md` の末尾に"
+              " / 準決勝の当日の手順書 `docs/SEMIFINAL.md`、"
+              "他高専の解説集34ページの読み取り `docs/RIVALS.md` 入り"
+              " / テスト619件")
+
+
+def build_line() -> str:
+    """起動時に出す1行。models の学習量もあれば添えます。"""
+
+    extra = ""
+    try:
+        import json
+
+        path = BASE_DIR / "models" / "population.json"
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            brains = data.get("brains", [])
+            if brains:
+                episodes = brains[0].get("trainedEpisodes", 0)
+                width = len(brains[0].get("touringHeads", [[]])[0])
+                size = {40: "simple", 211: "cross", 781: "large"}.get(width, f"{width}個")
+                extra = f" / AI {len(brains)}体 {size} 通算{episodes}エピソード"
+    except Exception:
+        extra = ""
+    return f"版 {BUILD_VERSION}（{BUILD_NOTE}）{extra}"
 
 
 ENV_NAME = ".env"
@@ -1473,6 +1738,248 @@ def menu_grow() -> None:
     print("  続けて「2. AIを学習させる」で学習してください。")
 
 
+
+def _print_static_ip_steps(role: str = "サーバー") -> None:
+    """固定IPの入れ方を画面に出す。
+
+    **なぜ画面に出すか**
+
+    Windowsが「識別されていないネットワーク」と出すのは、DHCPが無くて
+    アドレスが決まらない状態です。LANケーブル直結やハブだけの接続だと
+    必ずこうなります。このときは手でアドレスを決めるしかありません。
+    設定の場所は Windows のバージョンで変わるので、画面の順路と
+    コマンドの両方を出します。
+    """
+
+    first = "192.168.50.1" if role == "サーバー" else "192.168.50.2"
+    other = "192.168.50.2" if role == "サーバー" else "192.168.50.1"
+    print()
+    print("  == 固定IPの入れ方（Windows） ==")
+    print()
+    print("  決めること（2台で違う番号にします）")
+    print(f"    このPC（{role}側） IPアドレス    : {first}")
+    print(f"    相手のPC                        : {other}")
+    print("    サブネットマスク（両方同じ）     : 255.255.255.0")
+    print("    デフォルトゲートウェイ           : 空のまま")
+    print("    DNS                              : 空のまま")
+    print("  ※ ゲートウェイを空にすると「インターネットなし」と出ますが、")
+    print("     LAN内だけの対戦なら問題ありません。")
+    print()
+    print("  画面から入れる場合")
+    print("    1. 設定 → ネットワークとインターネット")
+    print("    2. 「ネットワークの詳細設定」→「ネットワーク アダプター")
+    print("       オプションの詳細」（古い版では「アダプターのオプションを")
+    print("       変更する」）")
+    print("    3. 使っている有線アダプター（イーサネット）を右クリック →")
+    print("       プロパティ")
+    print("    4. 「インターネット プロトコル バージョン 4 (TCP/IPv4)」を")
+    print("       選んで「プロパティ」")
+    print("    5. 「次のIPアドレスを使う」を選び、上の数字を入れる")
+    print("    6. OK → OK で閉じる")
+    print()
+    print("  コマンドで入れる場合（管理者のPowerShellで1行ずつ）")
+    print("    まずアダプターの名前を調べます:")
+    print("      Get-NetAdapter | Format-Table Name,Status,LinkSpeed")
+    print('    名前が「イーサネット」なら:')
+    print(f'      netsh interface ip set address name="イーサネット" '
+          f'static {first} 255.255.255.0')
+    print("    元に戻す（DHCPに戻す）とき:")
+    print('      netsh interface ip set address name="イーサネット" dhcp')
+    print()
+    print("  **無線は切ってください。** 有線と無線の両方が繋がっていると、")
+    print("  どちらを使うか迷って繋がらないことがあります。")
+    print()
+    print("  入れ終わったら、相手のPCから届くか確かめます:")
+    print(f"      ping {other}")
+    print("  これが通れば、あとはファイアウォールだけです。")
+
+
+def menu_firewall() -> None:
+    """LAN対戦の準備を、この画面だけで済ませる。
+
+    PowerShellのコマンドを打たなくても、ファイアウォールの許可は
+    ここから入れられます（管理者の確認に「はい」と答えるだけ）。
+    固定IPはWindowsの設定でしか変えられないので、手順を出します。
+    """
+
+    import platform
+
+    while True:
+        print()
+        print("== LAN対戦の準備 ==")
+        print("  くわしい手順は docs/LAN.md にあります（上から順に")
+        print("  たどれば終わるように書いてあります）。")
+        print()
+        print("  **ケーブルで詰まったら、同じWi-Fiにつなぐほうが簡単です。**")
+        print("  2台を同じWi-Fi（スマホのテザリングでも可）につないで、")
+        print("  サーバー役で14番 → 出たURLを選手役の20番に入れるだけ。")
+        print("  設定は1つも要りません（docs/LAN.md の最初の節）。")
+        print("  1. このPCのアドレスを見る")
+        print("  2. 固定IPの入れ方を見る")
+        print("  3. ファイアウォールで受信を許可する")
+        print("  4. ファイアウォールの許可を消す")
+        print("  5. 相手のPCに届くか確かめる")
+        print("  6. **いまの状態をまとめて見る**（これが一番速い）")
+        print("  7. 手順書（docs/LAN.md）をそのまま表示する")
+        print("  0. 戻る")
+        choice = ask("番号", "1")
+        if choice == "0":
+            return
+        if choice == "1":
+            from hexa.localserver import local_ips
+
+            print()
+            print("  このPCのアドレス（別PCから繋ぎやすい順）:")
+            for found in local_ips():
+                note = ""
+                if found.startswith("127."):
+                    note = "  ← 自分からしか見えません"
+                elif found.startswith("169.254."):
+                    note = "  ← DHCPなし。固定IPを入れてください（2番）"
+                print(f"    {found}{note}")
+            continue
+        if choice == "2":
+            role = ask_choice("このPCはどちらですか",
+                              ["サーバー", "クライアント"], "サーバー")
+            _print_static_ip_steps(role)
+            continue
+        if choice in ("3", "4"):
+            if platform.system() != "Windows":
+                print("  このPCはWindowsではないので、設定は要りません。")
+                continue
+            port = ask("ポート番号", "8080")
+            try:
+                number = int(port)
+            except ValueError:
+                print("  数字を入れてください。")
+                continue
+            if choice == "3":
+                done, message = open_firewall(number)
+            else:
+                done, message = close_firewall(number)
+            print()
+            print(f"  {'成功' if done else '失敗'}: {message}")
+            if done and choice == "3":
+                print("  入っている規則は、対話で次を打てば確認できます:")
+                print(f'    netsh advfirewall firewall show rule '
+                      f'name="{_firewall_rule_name(number)}"')
+            continue
+        if choice == "5":
+            target = ask("相手のURL（例 http://192.168.50.1:8080）", "")
+            if not target:
+                print("  URLが空です。")
+                continue
+            from hexa.client import ProconClient
+
+            token = ask("トークン（分からなければ空のまま）", "")
+            if token:
+                ok, message = ProconClient(target, token).check_connection()
+                print()
+                print(f"  {'成功' if ok else '失敗'}: {message}")
+                if not ok:
+                    _explain_connection_failure(target)
+            else:
+                _explain_connection_failure(target)
+            continue
+        if choice == "6":
+            _lan_overview()
+            continue
+        if choice == "7":
+            path = BASE_DIR / "docs" / "LAN.md"
+            if path.exists():
+                print()
+                print(path.read_text(encoding="utf-8"))
+            else:
+                print(f"  {path} が見つかりません。")
+            continue
+        print("  その番号はありません。")
+
+
+def _lan_overview() -> None:
+    """**いまの状態を1画面で出す。** LANで詰まったとき最初に見る所。
+
+    LANでつながらない原因は、ほぼ次の4つに収まります。
+
+      1. アドレスが別の網（DHCPが無いのに固定IPを入れていない）
+      2. ファイアウォールが受信を止めている（とくに「パブリック」）
+      3. サーバーが 127.0.0.1 でしか待っていない
+      4. 無線と有線が両方生きていて、経路を取り違えている
+
+    どれなのかは、この4つを並べて見れば分かります。
+    """
+
+    import platform
+    import subprocess
+
+    from hexa.localserver import local_ips
+
+    print()
+    print("  == いまの状態 ==")
+    found = list(local_ips())
+    others = [item for item in found if not item.startswith("127.")]
+    print("  (1) このPCのアドレス")
+    for item in found:
+        note = ""
+        if item.startswith("127."):
+            note = "  ← 自分からしか見えません"
+        elif item.startswith("169.254."):
+            note = "  ← DHCPなし。相手も169.254なら通じます"
+        print(f"        {item}{note}")
+    if not others:
+        print("        ※ LANのアドレスがありません。ケーブルを差して")
+        print("           1分待ってから、もう一度6番を押してください。")
+    if len(others) > 1:
+        print("        ※ **2つ以上あります。** 無線と有線の両方が生きて")
+        print("           いる可能性があります。試合中は無線を切るのが")
+        print("           確実です（Windows + A → Wi-Fi を押す）。")
+    if platform.system() != "Windows":
+        print("  (2)(3)(4) このPCはWindowsではないので省きます。")
+        return
+    def run(command: str) -> str:
+        try:
+            done = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                   command], capture_output=True, text=True,
+                                  timeout=20)
+            return (done.stdout or "") + (done.stderr or "")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+    print("  (2) ファイアウォールの許可（この道具が入れた規則）")
+    text = run('Get-NetFirewallRule -DisplayName "procon*"'
+               ' | Select-Object -ExpandProperty DisplayName')
+    names = [line.strip() for line in text.splitlines() if line.strip()]
+    if names:
+        for name in names:
+            print(f"        {name} … 入っています")
+    else:
+        print("        ありません。サーバー役なら3番で入れてください。")
+    print("  (3) いま待ち受けているポート")
+    text = run("Get-NetTCPConnection -State Listen"
+               " | Where-Object {$_.LocalPort -ge 8000"
+               " -and $_.LocalPort -lt 9000}"
+               " | ForEach-Object {\"$($_.LocalAddress):$($_.LocalPort)\"}")
+    rows = sorted({line.strip() for line in text.splitlines() if line.strip()})
+    if rows:
+        for row in rows:
+            note = ""
+            if row.startswith("0.0.0.0") or row.startswith("::"):
+                note = "  ← 外から受けられます（これが正解）"
+            elif row.startswith("127.") :
+                note = "  ← 自分専用。14番で立て直してください"
+            print(f"        {row}{note}")
+    else:
+        print("        8000〜8999で待っているものはありません。")
+        print("        サーバー役なら14番でサーバーを立ててください。")
+    print("  (4) ネットワークの種類（パブリックだと受信が止まりがち）")
+    text = run("Get-NetConnectionProfile"
+               " | ForEach-Object {\"$($_.InterfaceAlias) ="
+               " $($_.NetworkCategory)\"}")
+    for line in text.splitlines():
+        if line.strip():
+            print(f"        {line.strip()}")
+    print()
+    print("  困ったら docs/LAN.md（7番で表示）を上から順に。")
+
+
 MENU = [
     ("1", "問題を作る", menu_generate),
     ("2", "AIを学習させる", menu_train),
@@ -1495,11 +2002,13 @@ MENU = [
     ("18", "リアルタイム監視を開く", menu_live_viewer),
     ("19", "トークンを登録する", menu_token),
     ("20", "本番（大会当日）", menu_tournament),
+    ("21", "LAN対戦の準備（固定IP・ファイアウォール）", menu_firewall),
 ]
 
 
 def main() -> None:
     print("ヘキサうどん AI（第37回 高専プロコン 競技部門）")
+    print(build_line())
     print(f"作業フォルダ: {BASE_DIR}")
     print(f"Python {sys.version.split()[0]}")
     while True:

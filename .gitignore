@@ -1,6 +1,5 @@
 __pycache__/
 *.py[cod]
-models/
 problems/*
 !problems/sample/
 answers/
@@ -15,3 +14,6 @@ tmp_verify/
 
 # トークンを書くファイル。絶対に push しない。
 .env
+
+# 練習場の行動記録
+logs/

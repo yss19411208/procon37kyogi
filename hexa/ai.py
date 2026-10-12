@@ -53,6 +53,39 @@ from hexa.rules import AgentKind, RoadStatus, Terrain
 # それは判断の誤りではなく、**そちらへ行かないほうが得だった**可能性が高い。
 _PREFER_FRESH_BRANDS = False
 
+# 補給の合流先に「相手の経路の途中」を入れるか。
+#
+# 実戦1025の6日目（190歩）では、巡回車が120〜134歩も補給待ちで
+# 止まっていました。補給車1台で4台を回るため、現在地まで迎えに行くと
+# 順番待ちが長くなります。相手が進む先で落ち合えば待ち時間が縮みます。
+#
+#   途中で合流なし: 日別364 / 玉829
+#   途中で合流あり: 日別364 / 玉835  ← 採用
+_MEET_ON_THE_WAY = True
+
+# 燃料がこの割合以上ある車は、補給の相手に選びません。
+#
+# **1.01（事実上の無効）が最良でした。**
+#
+# 実戦のログでは、補給830回のうち637回が「ほぼ満タンの車」に対する
+# もので、無駄に見えました（燃料262で差9〜33など）。そこで追いかけるのを
+# やめたところ、**玉数が大きく落ちました**。
+#
+#   0.80: 16x16 95% / 24x24 90% / 32x32 87% / 1067 84%
+#   0.95: 16x16 94% / 24x24 89% / 32x32 84% / 1067 92%
+#   1.01: 16x16 96% / 24x24 90% / 32x32 93% / 1067 92%  ← 採用
+#
+# 満タンに近い車への補給は無駄ではなく、**先回りして満タンを保つ**
+# 動きでした。補給車はどのみち暇なので、ついでに満たしておくほうが
+# あとで効きます。
+SUPPLY_SKIP_RATIO = 1.01
+
+# 残り歩数に余裕があるとき、未取得系列の店にも2台目を送るか。
+#
+# **実測で効かなかったので 0 にしています。**
+# 1356で 玉327 → 322（条件1.0）→ 313（条件2.0）と悪化しました。
+STACK_WHEN_ROOMY = 0.0
+
 TOURING_BASE_COUNT = 40
 SUPPLY_BASE_COUNT = 18
 
@@ -225,15 +258,70 @@ class Brain:
         展開後を貯めると7.6倍のメモリを食います。
         """
 
-        features = _expand(base, self.touring_cross)
-        return (
-            _dot(self.touring_heads[0], features),
-            _dot(self.touring_heads[1], features),
-            _dot(self.touring_heads[2], features),
-        )
+        # **特徴を作らずに、そのまま内積を取ります。**
+        #
+        # 以前は「素の材料に積を足したリスト」を作ってから内積を
+        # 3回取っていました。1案を作るあいだに `append` が527万回
+        # 呼ばれ、_expand だけで全体の2割を占めます。
+        #
+        # 掛け算の項は作った端から足せるので、リストは要りません。
+        # 16x16 で1案32ミリ秒 → 候補を増やす余地が生まれます。
+        heads = self.touring_heads
+        first = heads[0]
+        second = heads[1]
+        third = heads[2]
+        limit = len(first)
+        count = min(len(base), limit)
+        total0 = total1 = total2 = 0.0
+        for index in range(count):
+            value = base[index]
+            if value:
+                total0 += first[index] * value
+                total1 += second[index] * value
+                total2 += third[index] * value
+        at = len(base)
+        cross = self.touring_cross
+        for position in range(len(cross)):
+            left = base[cross[position]]
+            for other in range(position, len(cross)):
+                if at >= limit:
+                    return (total0, total1, total2)
+                if left:
+                    product = left * base[cross[other]]
+                    if product:
+                        total0 += first[at] * product
+                        total1 += second[at] * product
+                        total2 += third[at] * product
+                at += 1
+        return (total0, total1, total2)
 
     def predict_supply(self, base: list[float]) -> float:
-        return _dot(self.supply_weights, _expand(base, self.supply_cross))
+        # 巡回車と同じく、特徴を作らずに内積を取ります。
+        #
+        # 重みが特徴より短いことがあるので（学習の途中で材料が
+        # 増えた場合）、短いほうで打ち切ります。`_dot` が zip で
+        # 同じことをしていました。
+        weights = self.supply_weights
+        limit = len(weights)
+        total = 0.0
+        count = min(len(base), limit)
+        for index in range(count):
+            value = base[index]
+            if value:
+                total += weights[index] * value
+        at = len(base)
+        cross = self.supply_cross
+        for position in range(len(cross)):
+            left = base[cross[position]]
+            for other in range(position, len(cross)):
+                if at >= limit:
+                    return total
+                if left:
+                    product = left * base[cross[other]]
+                    if product:
+                        total += weights[at] * product
+                at += 1
+        return total
 
     def update_touring(self, base: list[float], rewards: list[float], alpha: float) -> None:
         """重みを更新する。材料の大きさで割ってから進む（正規化）。
@@ -490,7 +578,12 @@ class Policy:
         rng: random.Random,
         epsilon: float = 0.0,
         route_budget: int = 12,
+        recipes: list[list[float]] | None = None,
     ) -> None:
+        # その試合用に差し替えた作戦。None なら学習済みのものを使います。
+        # 本番では、良い結果を出した作戦を少し変えながら探すので、
+        # ここに毎回違うものが入ります。
+        self.override_recipes = recipes
         # 1回の判断で試す作戦の数。試合開始前の試走のように
         # 「たくさん回すこと自体に意味がある」場面では小さくします。
         self.route_budget = route_budget
@@ -674,6 +767,15 @@ class Policy:
         # 店ごとに「1台だけ」と決めていたときは、余力があるのに重ねられず
         # 玉を取り逃していました。逆に無条件に重ねると系列を落とします。
         # **全体の台数で見れば、系列に必要な分を確保したうえで余力だけ回せます。**
+        # **台数の配分で決めます。**
+        #
+        # 今日まだ取っていない系列の数より、手の空いている車のほうが多いなら、
+        # 余った台数は在庫の多い店へ重ねて構いません。
+        #
+        # 「1日に何回訪問できるか」で配分する案も試しましたが、
+        # **実測で悪化しました**（玉470→457、制限なしでは399）。
+        # 早い段階で在庫の多い店に重ねると、遠い系列へ向かう車が足りなくなり、
+        # 結局そこへ戻るのに歩数を使うためだと見ています。
         fresh_brands = {
             spot.brand for spot in self.problem.spots
             if spot.brand not in brands_today
@@ -685,6 +787,19 @@ class Policy:
         free = max(1, touring_total - busy)
         # 系列集めに必要な台数より車が多いときだけ、未取得系列の店にも重ねる。
         fresh_limit = 1 if free <= len(fresh_brands) else 1 + (free - len(fresh_brands))
+        # **残り歩数に余裕があれば、早い段階でも重ねます。**
+        #
+        # 実戦1356では日別152（満点）なのに玉344、1位は427でした。
+        # 系列19を取るのに19訪問、残りが「2台目以降」です。
+        # 私たちは24訪問、1位は34訪問。重ね方が足りません。
+        #
+        # 未取得の系列が残っていても、残り歩数でまだ回れるなら
+        # 重ねたほうが得です。
+        if STACK_WHEN_ROOMY > 0 and fresh_brands:
+            span = max(4, (self.problem.width + self.problem.height) // 6)
+            rounds = remaining // span
+            if rounds > len(fresh_brands) * STACK_WHEN_ROOMY:
+                fresh_limit = max(fresh_limit, 2)
 
         available = {}
         for spot in self.problem.spots:
@@ -714,7 +829,11 @@ class Policy:
         # 全部試すと、作戦48個で1判断20ミリ秒（8個なら5ミリ秒）。
         # 実戦で1日の候補が数千件から20件まで落ちていた原因がこれ。
         # 出発点の8つは常に入れ、残りは成績の良かったものから選ぶ。
-        recipes = self.brain.working_recipes(self.route_budget)
+        recipes = (
+            self.override_recipes
+            if self.override_recipes is not None
+            else self.brain.working_recipes(self.route_budget)
+        )
         if self.epsilon > 0.0 and len(recipes) >= 2:
             for _ in range(2):
                 blended = blend_recipes(
@@ -978,10 +1097,34 @@ class Policy:
         for other in range(len(kinds)):
             if kinds[other] != AgentKind.TOURING:
                 continue
+            # **燃料が足りている車は追いかけません。**
+            #
+            # 実戦のログで、補給830回のうち637回が「ほぼ満タンの車」に
+            # 対するものでした（燃料262で差9〜33など）。補給車が同じマスに
+            # 居るだけで自動的に起きるので、追いかけるだけ歩数の無駄です。
+            # その間、本当に困っている車を待たせています。
+            if fuels[other] >= self.fuel_limit * SUPPLY_SKIP_RATIO:
+                continue
             # 合流地点は、相手の現在地か、相手が向かっている目標セル。
+            #
+            # **その途中のセルも候補に入れます。**
+            # 実戦1025の6日目（190歩）では、巡回車が120〜134歩も
+            # 補給待ちで止まっていました。補給車1台で4台を回るので、
+            # 現在地まで迎えに行くと順番待ちが長くなります。
+            # 相手が進む先で落ち合えば、待ち時間を縮められます。
             meeting_options = {positions[other]}
-            if plan_targets[other] is not None:
-                meeting_options.add(plan_targets[other])
+            target = plan_targets[other]
+            if target is not None:
+                meeting_options.add(target)
+                if _MEET_ON_THE_WAY:
+                    path = finder.table(positions[other], road_status)
+                    if path.reachable(target):
+                        half = path.steps[target] // 2
+                        if half > 0:
+                            for cell, steps in path.steps.items():
+                                if steps == half:
+                                    meeting_options.add(cell)
+                                    break
             other_table = finder.table(positions[other], road_status)
             reachable_spots = sum(
                 1

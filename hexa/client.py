@@ -28,6 +28,28 @@ from hexa.rules import AgentKind, RoadStatus
 
 MIN_REQUEST_INTERVAL = 0.21     # 秒間5リクエストを超えないための最短間隔
 
+# **提出は何度でも試します。**
+#
+# 準決勝の32x32（第1791641357試合）で、3日目の提出が1回失敗した
+# だけで**その日は7台が1歩も動きませんでした**。ログの「実際の
+# 3日目終了時の燃料」は開始時と1ビットも同じで、日別は
+# 22+22+**0**+22+22+22 に落ちています（手元の予測は132、実際は112）。
+#
+# `post_actions` には再試行が1つもなく、通信が一瞬切れただけで
+# 1日を捨てる作りでした。会場の回線は落ちるものとして扱います。
+POST_RETRIES = 6
+# 再試行の待ち（秒）。回数ごとに倍にしていきます。
+POST_RETRY_WAIT = 0.3
+# これ以上は待たない（1日の持ち時間を食いつぶさないため）。
+POST_RETRY_WAIT_MAX = 2.0
+# **やり直しても意味がないサーバーの答え。**
+# 計画そのものが悪い（長さ違い・池へ移動など）ので、同じものを
+# 投げ直しても通りません。呼んだ側が別の計画を出すべきです。
+FATAL_POST_CODES = frozenset({
+    "ValidationError", "FormatError", "BadRequest",
+    "AccessTimeError", "NotFound", "Unauthorized", "Forbidden",
+})
+
 
 class ProconApiError(RuntimeError):
     def __init__(self, status: int, code: str, message: str) -> None:
@@ -143,11 +165,38 @@ class ProconClient:
             },
         )
 
-    def post_actions(self, action_plan: list[list[int]]) -> int:
-        raw = self._request("POST", "/", action_plan)
-        if isinstance(raw, dict) and "revision" in raw:
-            return int(raw["revision"])
-        return 0
+    def post_actions(self, action_plan: list[list[int]], log=None) -> int:
+        """行動計画を出す。**通信の失敗は何度でも試し直します。**
+
+        理由は `POST_RETRIES` に。計画そのものが悪いときだけは、
+        同じものを投げ直しても通らないので、すぐ上へ返します。
+        """
+
+        wait = POST_RETRY_WAIT
+        last: Exception | None = None
+        for attempt in range(1, POST_RETRIES + 1):
+            try:
+                raw = self._request("POST", "/", action_plan)
+                if isinstance(raw, dict) and "revision" in raw:
+                    return int(raw["revision"])
+                return 0
+            except ProconApiError as error:
+                last = error
+                if error.code in FATAL_POST_CODES:
+                    raise
+                # 429（投げすぎ）や5xx（サーバー側）は待てば通ります。
+            except (OSError, TimeoutError, urllib.error.URLError) as error:
+                # 回線が切れた・応答が遅い。待って投げ直します。
+                last = error
+            if attempt < POST_RETRIES:
+                if log is not None:
+                    log(f"  提出をやり直します（{attempt}回目が失敗:"
+                        f" {type(last).__name__} {last}）")
+                time.sleep(wait)
+                wait = min(POST_RETRY_WAIT_MAX, wait * 2)
+        if isinstance(last, ProconApiError):
+            raise last
+        raise ProconApiError(0, "NetworkError", str(last))
 
     # ---------------- 補助 ----------------
 
@@ -156,6 +205,7 @@ class ProconClient:
         poll_interval: float = 1.0,
         timeout: float = 3600.0,
         log=None,
+        waiting=None,
     ) -> tuple[Problem, dict]:
         """試合設定が取れるようになるまで待つ。
 
@@ -175,12 +225,27 @@ class ProconClient:
                 if int(raw.get("startsAt", 0)) != 0 or raw.get("map"):
                     return problem, raw
                 reason = "試合開始時刻がまだ確定していません"
+                linked = True
             except ProconApiError as error:
                 if error.code not in ("AccessTimeError", "NotFound"):
                     raise
+                # **サーバーには届いています。** 試合前に返る答えです。
                 reason = f"まだ試合前です（{error.code}）"
+                linked = True
             except (OSError, TimeoutError) as error:
                 reason = f"通信に失敗しました（{error}）"
+                linked = False
+
+            # **待っているあいだも監視に知らせます。**
+            #
+            # 以前は試合が始まるまで何も書かなかったので、ビューアは
+            # 前の試合のファイルを見るか、読めないままでした。開始
+            # 3分前なのに「つながりません」と出ていたのがこれです。
+            if waiting is not None:
+                try:
+                    waiting(reason, linked)
+                except Exception:
+                    pass
 
             if log is not None and not notified:
                 log(f"  {reason}。取得できるまで待ちます…")

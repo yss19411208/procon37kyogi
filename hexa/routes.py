@@ -31,7 +31,73 @@ from hexa.rules import RoadStatus, Terrain
 
 # 1つの作戦で連ねる店の数。到着ごとに組み直すので、3店先まで見えれば実質つながる。
 # 長くすると1回の判断が重くなり、学習量を稼げなくなる。
-MAX_ROUTE_LENGTH = 3
+MAX_ROUTE_LENGTH = 4
+
+# 先読みを長くするマス数の範囲。24x24（576マス）だけが対象です。
+#
+# 16x16（256マス）では逆効果でした（日別138→134）。店が近いので、
+# 長く見ると目先の1店を取り逃します。
+#
+# 32x32（1024マス）はさらに悪く、**1案が2倍重くなるうえ質も落ちます**。
+#
+#   4店: 54案/8秒（1案150ms）最良玉55
+#   6店: 40案/8秒（1案203ms）最良玉52
+#   8店: 28案/8秒（1案286ms）最良玉47
+#
+# 店の数は24で同じでも、マップが広いと経路の計算が重くなるためです。
+BIG_MAP_CELLS = 500
+BIG_MAP_MAX_CELLS = 700
+BIG_MAP_ROUTE_LENGTH = 8
+# 燃料上限がこれ以下のときだけ、先読みを長くします。
+#
+# 実測（実戦の渋滞をそのまま使って再現）:
+#   200以下: 1228=82% / 1233=94% / 1533=87%
+#   **130以下**: 1228=88% / 1233=92% / 1535=94%  ← 採用
+#   使わない: 1233=90%
+#
+# 燃料124・213の試合でも8店は不利でした（1533で玉265→261、
+# 1535で427→424）。候補が379〜1,470件しか作れないためです。
+BIG_MAP_FUEL_LIMIT = 130
+
+# 道が混んでいる日は、もう1店先まで見ます。
+#
+# **なぜ日によって変えるか**
+#
+# 渋滞すると店どうしが遠くなり（実戦927の2日目は中央値118歩）、
+# 3店先まででは「次の次」が見えません。4店先まで見ると、
+# その試合で日別が満点になり玉数も増えました（120/457 → 125/467）。
+#
+# ところが渋滞のない日に4店先まで見ると、かえって悪くなります
+# （9試合で日別の満点が7/8から6/8に減少）。先が見えるぶん
+# 「いまは良いが後で外れる」予測に引きずられるためだと見ています。
+#
+# そこで、**その日に渋滞している道路が多いときだけ**長く見ます。
+# 渋滞した日は、以前は1店多く見ていました。通常が4店になったので、
+# さらに増やすと1案あたりが重くなりすぎます（候補が作れず逆効果）。
+# いまは同じ4店で、切り替えは実質ありません。
+# 歩数が厳しい日に先を長く見る仕組み。**実測で入れませんでした。**
+#
+# 実戦のログで達成率は「上限1玉あたり使える歩数」でほぼ決まります
+# （3〜5歩で52%、9〜11歩で80%）。そこで厳しい日だけ5店先まで
+# 見るようにしたところ、厳しい試合では玉1008→1024（+16）でしたが、
+# **通常の試合で2489→2429（-60）と大きく損**をしました。
+# 閾値を4.0歩まで下げても2472で届きません。
+#
+# 0 にすると常に MAX_ROUTE_LENGTH（4店）を使います。
+TIGHT_STEPS_PER_NOODLE = 0.0
+TIGHT_ROUTE_LENGTH = 5
+JAMMED_ROUTE_LENGTH = 4
+# 渋滞した道路がこの割合を超えた日だけ、先を長く見ます。
+#
+# 実戦927（32x32・渋滞の多い試合）での実測:
+#
+#   3店固定        日別121 / 玉457
+#   渋滞25%で切替  日別123 / 玉443
+#   渋滞12%で切替  日別123 / 玉461  ← 採用
+#
+# 25%だと切り替わる日が少なく、玉数だけ落ちました。
+# 12%なら渋滞が始まった日から長く見られます。
+JAMMED_SHARE_FOR_LONGER = 0.12
 
 # 作戦を表す観点の数。
 CRITERIA_COUNT = 8
@@ -105,7 +171,8 @@ def blend_recipes(first: list[float], second: list[float], rng: random.Random) -
     ]
 
 
-def _score(recipe, spot, steps, need, acquired, seen, road_share, enemy, congestion):
+def _score(recipe, spot, steps, need, acquired, seen, road_share, enemy, congestion,
+           left=None):
     """作戦に従って店を採点する。小さいほど良い。
 
     1案を作るのに18万回呼ばれるので、ここの速さがそのまま
@@ -118,7 +185,14 @@ def _score(recipe, spot, steps, need, acquired, seen, road_share, enemy, congest
     total = recipe[0] * (steps / 30.0) + recipe[1] * (need / 30.0)
     w = recipe[2]
     if w:
-        total -= w * (spot.stocks / 7.0)
+        # 元の在庫と**残っている在庫**の両方を見ます。
+        #
+        # 残りだけで見ると、取り切りかけた店を避けすぎて逆効果でした。
+        # 元の在庫だけだと、取り切った店と手つかずの店が同じ評価になります。
+        # 実戦のログでは在庫4以上の店の43%に1台以下しか来ておらず、
+        # 取り逃しの93%が「届いたのに行かなかった」でした。
+        value = spot.stocks if left is None else (spot.stocks * 0.3 + left * 0.7)
+        total -= w * (value / 7.0)
     w = recipe[3]
     if w and spot.brand in acquired:
         total += w
@@ -170,6 +244,7 @@ def _build_one(
     road_cells: set[int],
     congestion_risk: dict[int, float] | None,
     road_heat: dict[int, float] | None,
+    max_length: int = MAX_ROUTE_LENGTH,
 ) -> Route:
     """1つの作戦で、数本の道すじを並行して伸ばし、一番良かったものを返す。
 
@@ -193,7 +268,7 @@ def _build_one(
          frozenset(), frozenset(brands_today))
     ]
 
-    for _ in range(MAX_ROUTE_LENGTH):
+    for _ in range(max_length):
         grown: list[tuple[float, Route, int, int, int, frozenset, frozenset]] = []
         for score_sum, route, position, left_steps, left_fuel, used, seen in beams:
             table = finder.table(position, road_status, fuel_weight(left_steps, left_fuel))
@@ -212,7 +287,7 @@ def _build_one(
                 if need > left_fuel:
                     continue
                 key = _score(recipe, spot, steps, need, acquired_brands, seen,
-                             0.0, 0.0, 0.0)
+                             0.0, 0.0, 0.0, available.get(position_of_spot))
                 rough.append((key, spot, steps, need))
             if not rough:
                 continue
@@ -226,7 +301,7 @@ def _build_one(
                         congestion_risk, road_heat,
                     )
                     exact = _score(recipe, spot, steps, need, acquired_brands, seen,
-                                   share, enemy, jam)
+                                   share, enemy, jam, available.get(spot.position))
                     picks.append((exact, spot, steps, need, share, enemy, jam))
                 picks.sort(key=lambda item: item[0])
             else:
@@ -421,6 +496,69 @@ def _jammed_status(finder: PathFinder, problem: Problem) -> dict[int, RoadStatus
     return cached
 
 
+def route_length_for(problem, road_status, remaining: int = 0,
+                     available: dict | None = None, touring: int = 1) -> int:
+    """その日に何店先まで見るか。
+
+    **「上限1玉あたりに使える歩数」で決めます。**
+
+    実戦のログ133日分を集計すると、達成率はこの値でほぼ決まります。
+
+        3〜5歩/玉:  83日 達成52%
+        6〜8歩/玉:  26日 達成74%
+        9〜11歩/玉: 17日 達成80%
+
+    歩数が足りない日ほど、先を長く見て「近くを取り切る順番」を
+    見つける価値があります。実測（歩数の厳しい5試合）:
+
+        3店: 日別486 / 玉1021
+        4店: 日別485 / 玉1008
+        5店: 日別487 / 玉1024  ← 厳しい日はこれ
+
+    余裕のある日は4店が勝つので（12試合で玉2444→2489）、
+    日によって変えます。
+    """
+
+    # **大きいマップでは長く見ます。**
+    #
+    # 24x24 の試合で、先読みを4店から8店に伸ばすと玉数が伸びました。
+    #
+    #   1228: 83% → 90%
+    #   1233: 87% → 91%
+    #   1320: 95% → 99%
+    #
+    # 店が散っているぶん、順番を工夫する余地が大きいためです。
+    # 一方 16x16 では逆効果でした（1219の日別が138→134）。
+    # 店が近いので、長く見ると目先の1店を取り逃します。
+    # **24x24 で、燃料が厳しい試合だけ先を長く見ます。**
+    #
+    # 燃料が潤沢な試合（上限361）では4店が勝ちました。
+    #
+    #   4店: 77案/8秒（1案105ms）最良玉64  ← 燃料361の試合
+    #   8店: 30案/8秒（1案271ms）最良玉61
+    #
+    # 燃料が厳しい試合（上限110〜120）では8店が勝ちます。
+    # 動ける歩数が限られるぶん、順番を練る価値が大きいためです。
+    base = MAX_ROUTE_LENGTH
+    if (BIG_MAP_CELLS <= problem.cell_count <= BIG_MAP_MAX_CELLS
+            and problem.fuel_limit <= BIG_MAP_FUEL_LIMIT):
+        base = BIG_MAP_ROUTE_LENGTH
+
+    if remaining <= 0 or not available:
+        return base
+    cap = 0
+    for spot in problem.spots:
+        left = available.get(spot.position, 0)
+        if left > 0:
+            cap += min(left, touring)
+    if cap <= 0:
+        return base
+    per_noodle = remaining * touring / cap
+    if per_noodle <= TIGHT_STEPS_PER_NOODLE:
+        return TIGHT_ROUTE_LENGTH
+    return base
+
+
 def build_routes(
     problem: Problem,
     finder: PathFinder,
@@ -444,11 +582,16 @@ def build_routes(
     plain_table = None
     routes: list[Route] = []
     seen: set[tuple[int, ...]] = set()
+    # 渋滞が多い日は、もう1店先まで見ます。
+    max_length = route_length_for(
+        problem, road_status, remaining, available,
+        max(1, sum(1 for _ in problem.agent_positions) - 1),
+    )
     for index, recipe in enumerate(recipes):
         route = _build_one(
             problem, finder, road_status, position, fuel, remaining,
             recipe, index, available, acquired_brands, brands_today,
-            road_cells, congestion_risk, road_heat,
+            road_cells, congestion_risk, road_heat, max_length,
         )
         if not route.spots:
             continue

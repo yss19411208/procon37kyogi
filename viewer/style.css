@@ -205,3 +205,45 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--team-2); o
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* キーボードの説明。狭い画面でも読めるように1列にする。 */
+.legend.keys {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px;
+}
+.legend.keys b {
+  display: inline-block;
+  min-width: 5.5em;
+  color: #fff;
+}
+
+/* 日ごとの成績の表。**どの日が悪かったのか**を一目で見るためのもの。 */
+table.daytable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+table.daytable th {
+  font-weight: 600;
+  color: #9fb3bd;
+  text-align: right;
+  padding: 2px 3px;
+  border-bottom: 1px solid #2b3942;
+  white-space: nowrap;
+}
+table.daytable td {
+  text-align: right;
+  padding: 2px 3px;
+  border-bottom: 1px solid #1d272d;
+}
+table.daytable tr[data-day] { cursor: pointer; }
+table.daytable tr[data-day]:hover { background: #1f2b33; }
+table.daytable tr.worst td { color: #ff9b8a; font-weight: 600; }
+.hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8fa3ad;
+}

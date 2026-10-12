@@ -23,6 +23,10 @@ const state = {
   size: 10,
   focus: 0,
   speed: 1,
+  // **止まっている車を光らせるか**（キーボードの f で切り替え）。
+  showStill: false,
+  // 1台だけ見たいときの席番号（キーボードの1〜9）。
+  stillOnly: null,
 };
 
 const BASE_INTERVAL_MS = 140;
@@ -374,6 +378,107 @@ function render() {
   updateReadout();
   renderAgentPanel();
   renderSpotPanel(stocks);
+  renderDayTable();
+}
+
+// **試合ぜんぶの日別一覧。**
+//
+// 1日ずつ見ていくと「どの日が悪かったのか」が分かりません。日ごとの
+// 系列・玉・移動回数・止まった割合・配った燃料を並べ、いちばん悪い日に
+// 飛べるようにします。悪い日は**その前の晩に燃料を使い切った**ことが
+// 原因なので、前日と並べて見られることが大事です。
+function dayStats(team, dayIndex) {
+  const day = team.days[dayIndex];
+  const roads = new Map();
+  (day.roadStatus || []).forEach((entry) => roads.set(entry.pos, entry.status));
+  const cells = state.data.problem.cells;
+  const last = day.steps.length - 1;
+  let moved = 0;
+  let still = 0;
+  let moves = 0;
+  let used = 0;
+  for (let seat = 0; seat < team.kinds.length; seat += 1) {
+    if (team.kinds[seat] === 1) continue;
+    const busy = new Array(last).fill(false);
+    for (let t = 0; t + 1 <= last; t += 1) {
+      const from = day.steps[t].positions[seat];
+      if (from === day.steps[t + 1].positions[seat]) continue;
+      const cost = moveSteps(cells[from], roads.get(from) || 0);
+      moves += 1;
+      used += cost;
+      for (let back = Math.max(0, t + 1 - cost); back <= t; back += 1) {
+        if (back < last) busy[back] = true;
+      }
+    }
+    for (let t = 0; t < last; t += 1) {
+      if (busy[t]) moved += 1;
+      else still += 1;
+    }
+  }
+  const brands = new Set(day.acquisitions.map((e) => e.brand));
+  let given = 0;
+  (day.refuels || []).forEach((e) => {
+    // 古いデータには入った量が入っていないので、そのときは回数だけ。
+    if (typeof e.after === "number" && typeof e.before === "number"
+        && e.after >= 0 && e.before >= 0) {
+      given += e.after - e.before;
+    } else {
+      given = -1;
+    }
+  });
+  if (given < 0) given = 0;
+  return {
+    brands: brands.size,
+    balls: day.acquisitions.length,
+    moves: moves,
+    perMove: moves ? used / moves : 0,
+    stillRate: moved + still ? still / (moved + still) : 0,
+    given: given,
+    startFuel: day.steps.length
+      ? day.steps[0].fuels.reduce((a, b, i) =>
+          team.kinds[i] === 1 ? a : a + b, 0)
+      : 0,
+  };
+}
+
+function renderDayTable() {
+  const box = el("daytable");
+  if (!box) return;
+  const team = state.data.teams[state.focus];
+  if (!team) { box.innerHTML = ""; return; }
+  const rows = team.days.map((_day, index) => dayStats(team, index));
+  let worst = 0;
+  rows.forEach((row, index) => {
+    if (row.stillRate > rows[worst].stillRate) worst = index;
+  });
+  let html = "<table class=\"daytable\"><tr>" +
+    "<th>日</th><th>系列</th><th>玉</th><th>移動</th>" +
+    "<th>1移動の歩</th><th>止まった</th><th>朝の燃料</th><th>配った</th></tr>";
+  rows.forEach((row, index) => {
+    const mark = index === worst ? " class=\"worst\"" : "";
+    const here = index === state.day ? " style=\"outline:1px solid #fff\"" : "";
+    html += "<tr" + mark + here + " data-day=\"" + index + "\">" +
+      "<td>" + (index + 1) + "</td>" +
+      "<td>" + row.brands + "</td>" +
+      "<td>" + row.balls + "</td>" +
+      "<td>" + row.moves + "</td>" +
+      "<td>" + row.perMove.toFixed(2) + "</td>" +
+      "<td>" + Math.round(row.stillRate * 100) + "%</td>" +
+      "<td>" + row.startFuel + "</td>" +
+      "<td>" + (row.given > 0 ? row.given : "-") + "</td>" +
+      "</tr>";
+  });
+  html += "</table>";
+  box.innerHTML = html;
+  box.querySelectorAll("tr[data-day]").forEach((row) => {
+    row.onclick = () => {
+      state.day = Number(row.dataset.day);
+      state.step = 0;
+      buildDaySelect();
+      syncStepRange();
+      render();
+    };
+  });
 }
 
 function updateHead() {
@@ -403,9 +508,62 @@ function updateReadout() {
     acquisitions += day.acquisitions.filter((e) => e.step <= state.step).length;
     refuels += day.refuels.filter((e) => e.step <= state.step).length;
   });
+  // **止まっている歩**を数えます。玉数の伸びないいちばんの原因が
+  // これなので、振り返りのときに真っ先に見たい数字です。
+  //
+  // **「位置が同じ歩」をそのまま数えてはいけません。** 1回の移動は
+  // 地形と渋滞で1〜4歩かかるので、移動の途中も位置は変わりません。
+  // 位置が変わったところを拾い、その移動にかかる歩数（**移動元の
+  // マス**で決まります）をさかのぼって「動いた」に付け替えます。
+  //
+  // 準決勝32x32を本物の渋滞で数えると、1日の半分近くが「燃料は
+  // あるのに止まっている」でした（燃料切れは0歩）。理由は
+  // 「どの店にも今日は着けない」で、そこを動きに変えるのがいまの
+  // いちばんの伸びしろです（docs/POLISH.md v1.52.0）。
+  const team = state.data.teams[state.focus];
+  let still = 0;
+  let dry = 0;
+  let moved = 0;
+  if (team) {
+    const day = team.days[state.day];
+    const roads = new Map();
+    (day.roadStatus || []).forEach((entry) => roads.set(entry.pos, entry.status));
+    const cells = state.data.problem.cells;
+    const last = Math.min(state.step, day.steps.length - 1);
+    for (let seat = 0; seat < team.kinds.length; seat += 1) {
+      if (team.kinds[seat] === 1) continue;
+      const busy = new Array(last).fill(false);
+      for (let t = 0; t + 1 <= last; t += 1) {
+        const from = day.steps[t].positions[seat];
+        if (from === day.steps[t + 1].positions[seat]) continue;
+        const cost = moveSteps(cells[from], roads.get(from) || 0);
+        for (let back = Math.max(0, t + 1 - cost); back <= t; back += 1) {
+          if (back < last) busy[back] = true;
+        }
+      }
+      for (let t = 0; t < last; t += 1) {
+        if (busy[t]) { moved += 1; continue; }
+        still += 1;
+        if (day.steps[t].fuels[seat] <= 0) dry += 1;
+      }
+    }
+  }
+  const all = Math.max(1, moved + still);
   el("readout").textContent =
     "ステップ " + state.step + " / " + total +
-    "　表示中のAIの獲得 " + acquisitions + "玉　補給 " + refuels + "回";
+    "　表示中のAIの獲得 " + acquisitions + "玉　補給 " + refuels + "回" +
+    "　／ 巡回車が動いた " + moved +
+    "（" + Math.round((100 * moved) / all) + "%）" +
+    " 止まった " + still +
+    "（" + Math.round((100 * still) / all) + "% ／ うち燃料ぎれ " + dry + "）";
+}
+
+// **1回の移動にかかる歩数。** 移動元のマスで決まります（要項1.1）。
+//   平地2 / 山地3 / 道路は順調1・混雑2・渋滞4
+function moveSteps(terrain, status) {
+  if (terrain === 1) return status === 2 ? 4 : status === 1 ? 2 : 1;
+  if (terrain === 2) return 3;
+  return 2;
 }
 
 // ---------- セルの詳細 ----------
@@ -513,6 +671,67 @@ el("play").onclick = () => {
 el("speed").addEventListener("change", (event) => {
   state.speed = Number(event.target.value) || 1;
   startPlayback();
+});
+
+// ---------- キーボードで動かす ----------
+//
+// 試合の振り返りは「1歩ずつ送って、止まっている車を探す」作業に
+// なります。マウスでスライダーを触るより、矢印キーのほうが速い。
+//
+//   空白 : 再生 / 一時停止      ← → : 1歩ずつ
+//   Shift+← → : 10歩ずつ        ↑ ↓ : 日を変える
+//   Home : 先頭へ               End : その日の最後へ
+//   1〜9 : その番号の車だけ表示を切り替える
+//   f    : 止まっている歩を光らせる
+document.addEventListener("keydown", (event) => {
+  if (event.target && /^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName)) {
+    return;
+  }
+  const total = maxStep();
+  const jump = event.shiftKey ? 10 : 1;
+  let used = true;
+  switch (event.key) {
+    case " ":
+      el("play").click();
+      break;
+    case "ArrowRight":
+      state.step = Math.min(total, state.step + jump);
+      break;
+    case "ArrowLeft":
+      state.step = Math.max(0, state.step - jump);
+      break;
+    case "ArrowUp":
+      if (state.day > 0) { state.day -= 1; el("day").value = String(state.day); syncStepRange(); }
+      break;
+    case "ArrowDown":
+      if (state.day < state.data.problem.daySteps.length - 1) {
+        state.day += 1; el("day").value = String(state.day); syncStepRange();
+      }
+      break;
+    case "Home":
+      state.step = 0;
+      break;
+    case "End":
+      state.step = total;
+      break;
+    case "f":
+    case "F":
+      state.showStill = !state.showStill;
+      break;
+    default:
+      if (/^[1-9]$/.test(event.key)) {
+        const seat = Number(event.key) - 1;
+        if (state.stillOnly === seat) state.stillOnly = null;
+        else state.stillOnly = seat;
+      } else {
+        used = false;
+      }
+  }
+  if (used) {
+    event.preventDefault();
+    el("step").value = String(state.step);
+    render();
+  }
 });
 
 window.addEventListener("resize", () => {

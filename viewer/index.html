@@ -45,6 +45,14 @@
   </div>
 
   <div class="field">
+    <label>日ごとの成績（行をクリックでその日へ）</label>
+    <div id="daytable"></div>
+    <p class="hint">「止まった」がいちばん高い日に印が付きます。悪い日は
+      <b>その前の晩に燃料を使い切った</b>ことが原因なので、前日の
+      「朝の燃料」と並べて見てください。</p>
+  </div>
+
+  <div class="field">
     <label>スポットの残り在庫</label>
     <div class="spot-list" id="spots"></div>
   </div>
@@ -64,7 +72,19 @@
     </div>
   </div>
 
-  <div class="inspector" id="inspector">マップのセルをクリックすると、地形と交通量の内訳が出ます。</div>
+  <div class="field">
+    <label>キーボードで動かす</label>
+    <div class="legend keys">
+      <div><b>空白</b> 再生 / 一時停止</div>
+      <div><b>← →</b> 1歩ずつ（Shiftで10歩）</div>
+      <div><b>↑ ↓</b> 日を変える</div>
+      <div><b>Home / End</b> その日の先頭 / 最後</div>
+      <div><b>1〜9</b> その番号の車だけ見る</div>
+      <div><b>f</b> 止まっている車を光らせる</div>
+    </div>
+  </div>
+
+  <div class="inspector" id="inspector">マップのセルをクリックすると、地形と交通量の内訳が出ます。<br>画面下の数字に「巡回車が動いた／止まった（うち燃料ぎれ）」が出ます。<b>止まった歩がいちばんの損</b>なので、まずここを見てください。</div>
 </aside>
 
 <main class="stage">
